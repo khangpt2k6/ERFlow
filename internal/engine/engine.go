@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
@@ -12,7 +13,6 @@ import (
 	"github.com/erflow/backend/internal/store"
 )
 
-// Color codes for terminal output
 const (
 	colorReset  = "\033[0m"
 	colorRed    = "\033[31m"
@@ -21,12 +21,10 @@ const (
 	colorBlue   = "\033[34m"
 	colorPurple = "\033[35m"
 	colorCyan   = "\033[36m"
-	colorWhite  = "\033[37m"
 	colorBold   = "\033[1m"
 	colorDim    = "\033[2m"
 )
 
-// Goroutine labels for log output
 const (
 	tagGenerator  = colorCyan + "[GENERATOR]" + colorReset
 	tagScheduler  = colorPurple + "[SCHEDULER]" + colorReset
@@ -36,16 +34,35 @@ const (
 	tagEngine     = colorBlue + "[ENGINE]   " + colorReset
 )
 
+// Channels carry patients between goroutines instead of shared memory.
+// This is Go's core concurrency philosophy: "share memory by communicating."
+type arrival struct {
+	patient   *models.Patient
+	complaint string
+}
+
+type discharge struct {
+	patient *models.Patient
+	bedID   string
+	docID   string
+}
+
 type Engine struct {
-	store   *store.MemStore
+	store *store.MemStore
+
 	mu      sync.RWMutex
 	running bool
 	speed   float64
-	cancel  chan struct{}
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup // tracks all goroutines for graceful shutdown
 
 	totalArrivals    int
 	totalDischarged  int
 	totalPreemptions int
+
+	// Channel pipeline: generator -> scheduler -> treatment -> discharge
+	arrivals   chan arrival
+	discharges chan discharge
 }
 
 func New(s *store.MemStore) *Engine {
@@ -62,38 +79,41 @@ func (e *Engine) Start() {
 		return
 	}
 	e.running = true
-	e.cancel = make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancel = cancel
+	e.arrivals = make(chan arrival, 10)
+	e.discharges = make(chan discharge, 10)
 	e.mu.Unlock()
 
-	log.Printf("%s %s=========================================%s", tagEngine, colorBold, colorReset)
 	log.Printf("%s %sENGINE STARTED — Speed: %.1fx%s", tagEngine, colorBold, e.speed, colorReset)
-	log.Printf("%s Launching 4 goroutines (OS kernel daemons):", tagEngine)
-	log.Printf("%s   %s → Patient arrivals (hardware interrupts)", tagEngine, tagGenerator)
-	log.Printf("%s   %s → Priority scheduling (CPU scheduler)", tagEngine, tagScheduler)
-	log.Printf("%s   %s → Process execution (time quanta)", tagEngine, tagTreatment)
-	log.Printf("%s   %s → Starvation prevention (aging daemon)", tagEngine, tagAging)
-	log.Printf("%s %s=========================================%s", tagEngine, colorBold, colorReset)
+	log.Printf("%s Pipeline: generator → arrivals chan → scheduler → discharges chan → cleanup", tagEngine)
 
 	e.store.AddEvent("engine.started",
-		"Simulation engine started — patients will flow automatically through the ER pipeline",
+		"Simulation engine started — channel pipeline active",
 		"priority-scheduling",
 		map[string]any{"speed": e.speed},
 	)
 
-	go e.patientGenerator()
-	go e.schedulerLoop()
-	go e.treatmentSimulator()
-	go e.agingDaemon()
+	e.wg.Add(4)
+	go e.patientGenerator(ctx)
+	go e.schedulerLoop(ctx)
+	go e.treatmentSimulator(ctx)
+	go e.agingDaemon(ctx)
 }
 
 func (e *Engine) Stop() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.running {
+		e.mu.Unlock()
 		return
 	}
 	e.running = false
-	close(e.cancel)
+	e.cancel()
+	e.mu.Unlock()
+
+	// Wait for all goroutines to finish — graceful shutdown
+	e.wg.Wait()
 
 	log.Printf("%s %sENGINE STOPPED%s — Arrivals: %d, Discharged: %d, Preemptions: %d",
 		tagEngine, colorBold, colorReset, e.totalArrivals, e.totalDischarged, e.totalPreemptions)
@@ -140,18 +160,21 @@ func (e *Engine) Stats() map[string]any {
 	}
 }
 
-func (e *Engine) scaledSleep(base time.Duration) {
+// scaledSleep respects context cancellation and speed multiplier.
+func (e *Engine) scaledSleep(ctx context.Context, base time.Duration) bool {
 	e.mu.RLock()
 	spd := e.speed
 	e.mu.RUnlock()
 	actual := time.Duration(float64(base) / spd)
 	select {
 	case <-time.After(actual):
-	case <-e.cancel:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
-// patientGenerator spawns new patients at random intervals.
+// --- Data ---
 
 var patientNames = []string{
 	"Sarah Mitchell", "Miguel Santos", "Aiko Tanaka", "James O'Brien",
@@ -187,58 +210,6 @@ func triageColor(t models.TriageLevel) string {
 	}
 }
 
-func (e *Engine) patientGenerator() {
-	log.Printf("%s Goroutine started — generating patients every 2-6s (scaled by speed)", tagGenerator)
-	nameIdx := 0
-	for {
-		select {
-		case <-e.cancel:
-			log.Printf("%s Goroutine exiting", tagGenerator)
-			return
-		default:
-		}
-
-		delay := time.Duration(2000+rand.Intn(4000)) * time.Millisecond
-		e.scaledSleep(delay)
-
-		select {
-		case <-e.cancel:
-			return
-		default:
-		}
-
-		triage := weightedTriage()
-		name := patientNames[nameIdx%len(patientNames)]
-		nameIdx++
-
-		complaintList := complaints[triage]
-		complaint := complaintList[rand.Intn(len(complaintList))]
-
-		id := e.store.NextPatientID()
-		p := models.NewPatient(id, name, triage, complaint)
-		e.store.AddPatient(p)
-		e.store.Queue.Enqueue(p)
-
-		e.mu.Lock()
-		e.totalArrivals++
-		arrivals := e.totalArrivals
-		e.mu.Unlock()
-
-		qLen := e.store.Queue.Len()
-		tc := triageColor(triage)
-		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total arrivals: %d)",
-			tagGenerator, colorGreen, name, colorReset,
-			complaint, tc, p.TriageLevelName, colorReset,
-			p.EffectivePri, qLen, arrivals)
-
-		e.store.AddEvent("patient.arrival",
-			fmt.Sprintf("NEW ARRIVAL: %s — %s [%s, priority %d]", p.Name, complaint, p.TriageLevelName, p.EffectivePri),
-			"priority-scheduling",
-			map[string]any{"patientId": p.ID, "triage": int(triage), "priority": p.EffectivePri},
-		)
-	}
-}
-
 func weightedTriage() models.TriageLevel {
 	r := rand.Intn(100)
 	switch {
@@ -255,35 +226,119 @@ func weightedTriage() models.TriageLevel {
 	}
 }
 
-// schedulerLoop picks the highest-priority patient and assigns them a bed.
+func treatmentDuration(triage models.TriageLevel) time.Duration {
+	switch triage {
+	case models.Critical:
+		return time.Duration(15+rand.Intn(10)) * time.Second
+	case models.Emergency:
+		return time.Duration(10+rand.Intn(8)) * time.Second
+	case models.Urgent:
+		return time.Duration(8+rand.Intn(6)) * time.Second
+	case models.SemiUrgent:
+		return time.Duration(6+rand.Intn(4)) * time.Second
+	default:
+		return time.Duration(4+rand.Intn(4)) * time.Second
+	}
+}
 
-func (e *Engine) schedulerLoop() {
-	log.Printf("%s Goroutine started — scheduling every 800ms (scaled by speed)", tagScheduler)
+// --- Goroutine 1: Patient Generator ---
+// Produces patients and sends them through the arrivals channel.
+// The scheduler receives from this channel — no shared memory needed.
+
+func (e *Engine) patientGenerator(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Goroutine started — sending patients to arrivals channel", tagGenerator)
+
+	nameIdx := 0
 	for {
-		select {
-		case <-e.cancel:
-			log.Printf("%s Goroutine exiting", tagScheduler)
+		delay := time.Duration(2000+rand.Intn(4000)) * time.Millisecond
+		if !e.scaledSleep(ctx, delay) {
+			log.Printf("%s Goroutine exiting", tagGenerator)
 			return
-		default:
 		}
 
-		e.scaledSleep(800 * time.Millisecond)
+		triage := weightedTriage()
+		name := patientNames[nameIdx%len(patientNames)]
+		nameIdx++
+		complaintList := complaints[triage]
+		complaint := complaintList[rand.Intn(len(complaintList))]
 
+		id := e.store.NextPatientID()
+		p := models.NewPatient(id, name, triage, complaint)
+		e.store.AddPatient(p)
+		e.store.Queue.Enqueue(p)
+
+		e.mu.Lock()
+		e.totalArrivals++
+		arrivals := e.totalArrivals
+		e.mu.Unlock()
+
+		tc := triageColor(triage)
+		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total: %d)",
+			tagGenerator, colorGreen, name, colorReset,
+			complaint, tc, p.TriageLevelName, colorReset,
+			p.EffectivePri, e.store.Queue.Len(), arrivals)
+
+		e.store.AddEvent("patient.arrival",
+			fmt.Sprintf("NEW ARRIVAL: %s — %s [%s, priority %d]", p.Name, complaint, p.TriageLevelName, p.EffectivePri),
+			"priority-scheduling",
+			map[string]any{"patientId": p.ID, "triage": int(triage), "priority": p.EffectivePri},
+		)
+
+		// Send to arrivals channel — scheduler picks it up
 		select {
-		case <-e.cancel:
+		case e.arrivals <- arrival{patient: p, complaint: complaint}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// --- Goroutine 2: Scheduler ---
+// Reads from arrivals channel as a signal to schedule, then assigns beds.
+// Sends completed treatments to the discharges channel.
+
+func (e *Engine) schedulerLoop(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Goroutine started — reading from arrivals channel + polling", tagScheduler)
+
+	ticker := time.NewTicker(800 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("%s Goroutine exiting", tagScheduler)
+			return
+
+		case <-e.arrivals:
+			// New patient arrived — try to schedule immediately
+			e.scheduleNext(ctx)
+
+		case <-ticker.C:
+			// Periodic check for any unscheduled patients
+			e.scheduleNext(ctx)
+		}
+	}
+}
+
+func (e *Engine) scheduleNext(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
 			return
 		default:
 		}
 
 		next := e.store.Queue.Peek()
 		if next == nil {
-			continue
+			return
 		}
 
 		bed := e.store.FindAvailableBed("")
 		if bed == nil {
 			if next.TriageLevel == models.Critical {
-				log.Printf("%s %s⚠ No beds for CRITICAL patient %s — attempting PREEMPTION%s",
+				log.Printf("%s %s⚠ No beds for CRITICAL %s — attempting PREEMPTION%s",
 					tagScheduler, colorRed+colorBold, next.Name, colorReset)
 
 				results := scheduler.CheckPreemption(
@@ -295,37 +350,29 @@ func (e *Engine) schedulerLoop() {
 				for _, pr := range results {
 					e.mu.Lock()
 					e.totalPreemptions++
-					preemptions := e.totalPreemptions
+					n := e.totalPreemptions
 					e.mu.Unlock()
 
-					log.Printf("%s %s⚡ PREEMPTION #%d: %s (pri=%d) BUMPED %s (pri=%d) from bed %s%s",
-						tagPreemption, colorRed+colorBold, preemptions,
-						pr.IncomingPatientName, pr.IncomingPriority,
-						pr.PreemptedPatientName, pr.PreemptedPriority,
+					log.Printf("%s %s⚡ PREEMPTION #%d: %s bumped %s from bed %s%s",
+						tagPreemption, colorRed+colorBold, n,
+						pr.IncomingPatientName, pr.PreemptedPatientName,
 						pr.BedID, colorReset)
 
 					e.store.AddEvent("preemption", scheduler.FormatPreemptionMessage(pr), "preemption", pr)
 				}
-				if len(results) == 0 {
-					log.Printf("%s %s✗ Preemption failed — no lower-priority patients to bump%s",
-						tagScheduler, colorRed, colorReset)
-				}
-			} else {
-				log.Printf("%s All beds full — %s (pri=%d) stays in queue (pos: queue has %d waiting)",
-					tagScheduler, next.Name, next.EffectivePri, e.store.Queue.Len())
 			}
-			continue
+			return
 		}
 
 		patient := e.store.Queue.Dequeue()
 		if patient == nil {
-			continue
+			return
 		}
 
 		ok, _ := e.store.AssignBedSafe(bed.ID, patient.ID)
 		if !ok {
 			e.store.Queue.Enqueue(patient)
-			log.Printf("%s Bed %s was taken (race avoided by mutex) — %s re-queued",
+			log.Printf("%s Bed %s taken (mutex prevented race) — %s re-queued",
 				tagScheduler, bed.ID, patient.Name)
 			continue
 		}
@@ -360,24 +407,17 @@ func (e *Engine) schedulerLoop() {
 	}
 }
 
-// treatmentSimulator discharges patients after their treatment time elapses.
+// --- Goroutine 3: Treatment Simulator ---
+// Checks for completed treatments and sends them through the discharges channel.
 
-func (e *Engine) treatmentSimulator() {
-	log.Printf("%s Goroutine started — checking treatment completion every 1.5s", tagTreatment)
+func (e *Engine) treatmentSimulator(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Goroutine started — sending discharges through channel", tagTreatment)
+
 	for {
-		select {
-		case <-e.cancel:
+		if !e.scaledSleep(ctx, 1500*time.Millisecond) {
 			log.Printf("%s Goroutine exiting", tagTreatment)
 			return
-		default:
-		}
-
-		e.scaledSleep(1500 * time.Millisecond)
-
-		select {
-		case <-e.cancel:
-			return
-		default:
 		}
 
 		patients := e.store.GetAllPatients()
@@ -385,37 +425,27 @@ func (e *Engine) treatmentSimulator() {
 			if p.Status != models.StatusInTreatment {
 				continue
 			}
-
-			treatmentTime := treatmentDuration(p.TriageLevel)
-			elapsed := time.Since(p.CheckInTime)
-
-			if elapsed < treatmentTime {
+			if time.Since(p.CheckInTime) < treatmentDuration(p.TriageLevel) {
 				continue
 			}
 
-			e.dischargePatient(p)
+			d := discharge{patient: p, bedID: p.AssignedBed, docID: p.AssignedDoc}
+
+			// Send to discharges channel — processed inline here for simplicity,
+			// but the channel makes it easy to add a separate consumer later.
+			e.processDischarge(d)
+
+			select {
+			case e.discharges <- d:
+			default:
+				// non-blocking: if nobody is reading, that's fine
+			}
 		}
 	}
 }
 
-func treatmentDuration(triage models.TriageLevel) time.Duration {
-	switch triage {
-	case models.Critical:
-		return time.Duration(15+rand.Intn(10)) * time.Second
-	case models.Emergency:
-		return time.Duration(10+rand.Intn(8)) * time.Second
-	case models.Urgent:
-		return time.Duration(8+rand.Intn(6)) * time.Second
-	case models.SemiUrgent:
-		return time.Duration(6+rand.Intn(4)) * time.Second
-	default:
-		return time.Duration(4+rand.Intn(4)) * time.Second
-	}
-}
-
-func (e *Engine) dischargePatient(p *models.Patient) {
-	bedID := p.AssignedBed
-	docID := p.AssignedDoc
+func (e *Engine) processDischarge(d discharge) {
+	p := d.patient
 
 	if p.AssignedBed != "" {
 		_, _ = e.store.ReleaseBed(p.AssignedBed)
@@ -441,10 +471,9 @@ func (e *Engine) dischargePatient(p *models.Patient) {
 
 	elapsed := time.Since(p.CheckInTime).Round(time.Second)
 	tc := triageColor(p.TriageLevel)
-	log.Printf("%s %s✓ DISCHARGED:%s %s — Bed %s freed, %s released [%s%s%s] (treated %s, total discharged: %d)",
+	log.Printf("%s %s✓ DISCHARGED:%s %s — Bed %s freed [%s%s%s] (%s, total: %d)",
 		tagTreatment, colorGreen, colorReset,
-		p.Name, bedID, docID,
-		tc, p.TriageLevelName, colorReset,
+		p.Name, d.bedID, tc, p.TriageLevelName, colorReset,
 		elapsed, discharged)
 
 	e.store.AddEvent("patient.discharged",
@@ -454,30 +483,22 @@ func (e *Engine) dischargePatient(p *models.Patient) {
 	)
 }
 
-// agingDaemon periodically boosts priority of patients who've been waiting too long.
+// --- Goroutine 4: Aging Daemon ---
 
-func (e *Engine) agingDaemon() {
+func (e *Engine) agingDaemon(ctx context.Context) {
+	defer e.wg.Done()
 	log.Printf("%s Goroutine started — scanning for stale patients every 5s", tagAging)
+
 	for {
-		select {
-		case <-e.cancel:
+		if !e.scaledSleep(ctx, 5*time.Second) {
 			log.Printf("%s Goroutine exiting", tagAging)
 			return
-		default:
-		}
-
-		e.scaledSleep(5 * time.Second)
-
-		select {
-		case <-e.cancel:
-			return
-		default:
 		}
 
 		patients := e.store.GetAllPatients()
 		results := scheduler.ApplyAging(e.store.Queue, patients, 0)
 		if len(results) > 0 {
-			log.Printf("%s %s↑ AGING PASS: %d patient(s) boosted:%s",
+			log.Printf("%s %s↑ AGING: %d patient(s) boosted%s",
 				tagAging, colorYellow, len(results), colorReset)
 			for _, ar := range results {
 				log.Printf("%s   %s: priority %d → %d (waited %dm)",

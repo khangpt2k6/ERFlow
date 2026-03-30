@@ -9,38 +9,21 @@ import (
 	"github.com/erflow/backend/internal/scheduler"
 )
 
-// MemStore is the in-memory state of the entire ER.
-//
-// OS parallel: This is like the kernel's process table + device table.
-// The OS kernel keeps all process info, device status, and resource state in
-// kernel memory — protected by locks so multiple CPU cores don't corrupt it.
-//
-// We use sync.RWMutex here: multiple goroutines can READ simultaneously
-// (RLock), but only ONE can WRITE at a time (Lock). This is a readers-writer
-// lock — a real OS primitive. It's more efficient than a plain mutex when
-// reads vastly outnumber writes (which they do here: the dashboard polls
-// constantly, but check-ins are occasional).
+// MemStore is the in-memory state of the entire ER, protected by a RWMutex.
 type MemStore struct {
 	mu       sync.RWMutex
 	patients map[string]*models.Patient
 	beds     map[string]*models.Bed
 	doctors  map[string]*models.Doctor
 
-	// The priority queue is the scheduler's ready queue.
-	// Patients in "waiting" status live here, sorted by effective priority.
 	Queue *scheduler.PatientQueue
 
 	nextPatientNum int
 
-	// Event log — the kernel's audit trail.
 	events       []*models.Event
 	nextEventNum int
 
-	// BedMu is the mutex that protects bed assignment.
-	// OS parallel: this is like a spinlock or mutex protecting a shared device.
-	// The "safe" assignment path acquires this lock; the "unsafe" path skips it
-	// to demonstrate what happens without mutual exclusion.
-	BedMu sync.Mutex
+	BedMu sync.Mutex // protects bed assignment (safe path acquires, unsafe path skips)
 }
 
 func NewMemStore() *MemStore {
@@ -88,9 +71,7 @@ func (s *MemStore) initializeER() {
 	}
 }
 
-// --- Event Operations ---
-
-// AddEvent appends an event to the log. Thread-safe.
+// AddEvent appends an event to the log.
 func (s *MemStore) AddEvent(eventType, message, concept string, details any) *models.Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,7 +88,7 @@ func (s *MemStore) AddEvent(eventType, message, concept string, details any) *mo
 	return ev
 }
 
-// GetEvents returns a copy of all events. Thread-safe.
+// GetEvents returns a copy of all events.
 func (s *MemStore) GetEvents() []*models.Event {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -116,15 +97,12 @@ func (s *MemStore) GetEvents() []*models.Event {
 	return result
 }
 
-// ClearEvents removes all events.
 func (s *MemStore) ClearEvents() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = nil
 	s.nextEventNum = 0
 }
-
-// --- Patient Operations ---
 
 func (s *MemStore) AddPatient(p *models.Patient) {
 	s.mu.Lock()
@@ -156,8 +134,6 @@ func (s *MemStore) NextPatientID() string {
 	return fmt.Sprintf("patient-%d", s.nextPatientNum)
 }
 
-// --- Bed Operations ---
-
 func (s *MemStore) GetAllBeds() []*models.Bed {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -175,14 +151,7 @@ func (s *MemStore) GetBed(id string) (*models.Bed, bool) {
 	return b, ok
 }
 
-// AssignBedSafe atomically checks if a bed is available and assigns it.
-//
-// OS parallel: This is the CORRECT way to access a shared resource — acquire
-// the mutex BEFORE the check-then-set operation. This makes the entire
-// "check if free → mark as occupied" operation ATOMIC, preventing TOCTOU
-// (Time-of-Check-to-Time-of-Use) race conditions.
-//
-// Returns (success, error).
+// AssignBedSafe atomically checks and assigns a bed (mutex-protected).
 func (s *MemStore) AssignBedSafe(bedID, patientID string) (bool, error) {
 	s.BedMu.Lock()
 	defer s.BedMu.Unlock()
@@ -209,15 +178,8 @@ func (s *MemStore) AssignBedSafe(bedID, patientID string) (bool, error) {
 	return true, nil
 }
 
-// AssignBedUnsafe intentionally does NOT lock. It reads, sleeps (simulating
-// processing delay), then writes — creating a TOCTOU race window.
-//
-// OS parallel: This is what happens when you forget to use a mutex. Two threads
-// both read "bed is free", both decide to assign it, and both write — last one
-// wins, and the first patient's assignment silently disappears. This is a
-// classic data race / lost update bug.
+// AssignBedUnsafe skips the mutex to demonstrate a TOCTOU race condition.
 func (s *MemStore) AssignBedUnsafe(bedID, patientID string) (bool, error) {
-	// Step 1: READ — is the bed free? (no lock!)
 	s.mu.RLock()
 	bed, ok := s.beds[bedID]
 	if !ok {
@@ -231,11 +193,7 @@ func (s *MemStore) AssignBedUnsafe(bedID, patientID string) (bool, error) {
 		return false, nil
 	}
 
-	// Step 2: DELAY — simulates processing time. During this window,
-	// another goroutine can also read "bed is free" and proceed.
-	time.Sleep(100 * time.Millisecond)
-
-	// Step 3: WRITE — assign the bed (no lock!)
+	time.Sleep(100 * time.Millisecond) // race window
 	s.mu.Lock()
 	bed.Occupied = true
 	bed.PatientID = patientID
@@ -248,7 +206,7 @@ func (s *MemStore) AssignBedUnsafe(bedID, patientID string) (bool, error) {
 	return true, nil
 }
 
-// ReleaseBed frees a bed and returns its patient to waiting status.
+// ReleaseBed frees a bed and resets the patient's status.
 func (s *MemStore) ReleaseBed(bedID string) (*models.Patient, error) {
 	s.BedMu.Lock()
 	defer s.BedMu.Unlock()
@@ -279,8 +237,7 @@ func (s *MemStore) ReleaseBed(bedID string) (*models.Patient, error) {
 	return released, nil
 }
 
-// FindAvailableBed returns the first unoccupied bed of the given type,
-// or any unoccupied bed if bedType is empty. Returns nil if none available.
+// FindAvailableBed returns an unoccupied bed matching the type (or any if empty).
 func (s *MemStore) FindAvailableBed(bedType models.BedType) *models.Bed {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -293,8 +250,6 @@ func (s *MemStore) FindAvailableBed(bedType models.BedType) *models.Bed {
 	}
 	return nil
 }
-
-// --- Doctor Operations ---
 
 func (s *MemStore) GetAllDoctors() []*models.Doctor {
 	s.mu.RLock()
@@ -313,7 +268,7 @@ func (s *MemStore) GetDoctor(id string) (*models.Doctor, bool) {
 	return d, ok
 }
 
-// FindAvailableDoctor returns a doctor with capacity for another patient.
+// FindAvailableDoctor returns a doctor with capacity.
 func (s *MemStore) FindAvailableDoctor() *models.Doctor {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -325,7 +280,6 @@ func (s *MemStore) FindAvailableDoctor() *models.Doctor {
 	return nil
 }
 
-// AssignDoctor assigns a patient to a doctor.
 func (s *MemStore) AssignDoctor(docID, patientID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,22 +302,15 @@ func (s *MemStore) AssignDoctor(docID, patientID string) error {
 	return nil
 }
 
-// --- Bed/Doctor Maps (for scheduler access) ---
-
-// GetBedsMap returns the internal beds map. Caller must hold appropriate locks
-// or use this only in contexts where the store lock is already held.
 func (s *MemStore) GetBedsMap() map[string]*models.Bed {
 	return s.beds
 }
 
-// GetDoctorsMap returns the internal doctors map.
 func (s *MemStore) GetDoctorsMap() map[string]*models.Doctor {
 	return s.doctors
 }
 
-// --- Reset ---
-
-// Reset clears all state and reinitializes the ER to defaults.
+// Reset clears all state and reinitializes the ER.
 func (s *MemStore) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

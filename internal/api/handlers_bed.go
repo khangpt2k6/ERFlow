@@ -11,28 +11,6 @@ import (
 	"github.com/erflow/backend/internal/store"
 )
 
-// =============================================================================
-// OS CONCEPT: MUTUAL EXCLUSION (mutex) and RACE CONDITIONS
-// =============================================================================
-//
-// A RACE CONDITION happens when two threads access shared data concurrently
-// and at least one of them writes. The result depends on the exact interleaving
-// of instructions — it's non-deterministic and almost always a bug.
-//
-// A MUTEX (mutual exclusion lock) prevents this. Only one thread can hold the
-// lock at a time. Others block until it's released. The "critical section"
-// (check-if-free then mark-as-occupied) runs atomically.
-//
-// The safe endpoint uses the mutex. The unsafe endpoint deliberately skips it,
-// introducing a TOCTOU (Time-of-Check-to-Time-of-Use) vulnerability:
-//   Thread A: reads bed.Occupied == false
-//   Thread B: reads bed.Occupied == false  (same bed!)
-//   Thread A: sets bed.Occupied = true, assigns patient A
-//   Thread B: sets bed.Occupied = true, assigns patient B  <- overwrites A!
-//
-// Patient A thinks they have a bed, but patient B actually has it. Classic race.
-// =============================================================================
-
 type BedHandler struct {
 	store *store.MemStore
 }
@@ -41,7 +19,7 @@ type AssignBedRequest struct {
 	PatientID string `json:"patientId"`
 }
 
-// AssignSafe handles POST /api/beds/{id}/assign — mutex-protected bed assignment.
+// AssignSafe handles POST /api/beds/{id}/assign (mutex-protected).
 func (h *BedHandler) AssignSafe(w http.ResponseWriter, r *http.Request) {
 	bedID := chi.URLParam(r, "id")
 
@@ -82,10 +60,7 @@ func (h *BedHandler) AssignSafe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Remove from the priority queue since they are now assigned
 	h.store.Queue.Remove(patient)
-
-	// Try to assign a doctor too
 	doc := h.store.FindAvailableDoctor()
 	docName := "none available"
 	if doc != nil {
@@ -108,7 +83,7 @@ func (h *BedHandler) AssignSafe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AssignUnsafe handles POST /api/beds/{id}/assign-unsafe — deliberately racy.
+// AssignUnsafe handles POST /api/beds/{id}/assign-unsafe (no mutex — intentionally racy).
 func (h *BedHandler) AssignUnsafe(w http.ResponseWriter, r *http.Request) {
 	bedID := chi.URLParam(r, "id")
 
@@ -159,7 +134,7 @@ func (h *BedHandler) AssignUnsafe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Release handles POST /api/beds/{id}/release — frees a bed.
+// Release handles POST /api/beds/{id}/release.
 func (h *BedHandler) Release(w http.ResponseWriter, r *http.Request) {
 	bedID := chi.URLParam(r, "id")
 
