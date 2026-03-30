@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -11,27 +12,39 @@ import (
 	"github.com/erflow/backend/internal/store"
 )
 
-// Engine is the heart of the simulation. It runs as background goroutines
-// that continuously push patients through the ER pipeline:
-//
-//   ARRIVAL → TRIAGE QUEUE → BED ASSIGNMENT → TREATMENT → DISCHARGE
-//
-// OS parallel: This is the kernel's main loop. In a real OS, background
-// daemons (kswapd, ksoftirqd, migration threads) run continuously to manage
-// memory, interrupts, and load balancing. Our engine goroutines do the same
-// for the ER: the scheduler assigns resources, the aging daemon prevents
-// starvation, and the treatment simulator models process execution time.
+// Color codes for terminal output
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[37m"
+	colorBold   = "\033[1m"
+	colorDim    = "\033[2m"
+)
+
+// Goroutine labels for log output
+const (
+	tagGenerator  = colorCyan + "[GENERATOR]" + colorReset
+	tagScheduler  = colorPurple + "[SCHEDULER]" + colorReset
+	tagTreatment  = colorGreen + "[TREATMENT]" + colorReset
+	tagAging      = colorYellow + "[AGING]    " + colorReset
+	tagPreemption = colorRed + "[PREEMPT]  " + colorReset
+	tagEngine     = colorBlue + "[ENGINE]   " + colorReset
+)
 
 type Engine struct {
 	store   *store.MemStore
 	mu      sync.RWMutex
 	running bool
-	speed   float64 // 1.0 = normal, 0.5 = slow, 3.0 = fast
+	speed   float64
 	cancel  chan struct{}
 
-	// Stats
-	totalArrivals   int
-	totalDischarged int
+	totalArrivals    int
+	totalDischarged  int
 	totalPreemptions int
 }
 
@@ -51,6 +64,15 @@ func (e *Engine) Start() {
 	e.running = true
 	e.cancel = make(chan struct{})
 	e.mu.Unlock()
+
+	log.Printf("%s %s=========================================%s", tagEngine, colorBold, colorReset)
+	log.Printf("%s %sENGINE STARTED — Speed: %.1fx%s", tagEngine, colorBold, e.speed, colorReset)
+	log.Printf("%s Launching 4 goroutines (OS kernel daemons):", tagEngine)
+	log.Printf("%s   %s → Patient arrivals (hardware interrupts)", tagEngine, tagGenerator)
+	log.Printf("%s   %s → Priority scheduling (CPU scheduler)", tagEngine, tagScheduler)
+	log.Printf("%s   %s → Process execution (time quanta)", tagEngine, tagTreatment)
+	log.Printf("%s   %s → Starvation prevention (aging daemon)", tagEngine, tagAging)
+	log.Printf("%s %s=========================================%s", tagEngine, colorBold, colorReset)
 
 	e.store.AddEvent("engine.started",
 		"Simulation engine started — patients will flow automatically through the ER pipeline",
@@ -73,11 +95,10 @@ func (e *Engine) Stop() {
 	e.running = false
 	close(e.cancel)
 
-	e.store.AddEvent("engine.stopped",
-		"Simulation engine paused",
-		"priority-scheduling",
-		nil,
-	)
+	log.Printf("%s %sENGINE STOPPED%s — Arrivals: %d, Discharged: %d, Preemptions: %d",
+		tagEngine, colorBold, colorReset, e.totalArrivals, e.totalDischarged, e.totalPreemptions)
+
+	e.store.AddEvent("engine.stopped", "Simulation engine paused", "priority-scheduling", nil)
 }
 
 func (e *Engine) IsRunning() bool {
@@ -95,12 +116,10 @@ func (e *Engine) SetSpeed(s float64) {
 	if s > 10 {
 		s = 10
 	}
+	old := e.speed
 	e.speed = s
-	e.store.AddEvent("engine.speed",
-		fmt.Sprintf("Simulation speed changed to %.1fx", s),
-		"priority-scheduling",
-		map[string]any{"speed": s},
-	)
+	log.Printf("%s Speed changed: %.1fx → %.1fx", tagEngine, old, s)
+	e.store.AddEvent("engine.speed", fmt.Sprintf("Simulation speed changed to %.1fx", s), "priority-scheduling", map[string]any{"speed": s})
 }
 
 func (e *Engine) GetSpeed() float64 {
@@ -121,7 +140,6 @@ func (e *Engine) Stats() map[string]any {
 	}
 }
 
-// scaledSleep sleeps for the given duration divided by speed.
 func (e *Engine) scaledSleep(base time.Duration) {
 	e.mu.RLock()
 	spd := e.speed
@@ -133,9 +151,10 @@ func (e *Engine) scaledSleep(base time.Duration) {
 	}
 }
 
-// --- GOROUTINE 1: Patient Generator ---
-// Continuously creates new patients at random intervals.
-// OS parallel: hardware interrupts bringing new work into the system.
+// =====================================================================
+// GOROUTINE 1: Patient Generator
+// OS concept: Hardware interrupts — new work arriving in the system
+// =====================================================================
 
 var patientNames = []string{
 	"Sarah Mitchell", "Miguel Santos", "Aiko Tanaka", "James O'Brien",
@@ -156,16 +175,32 @@ var complaints = map[models.TriageLevel][]string{
 	models.NonUrgent:  {"Common cold", "Minor headache", "Small cut", "Prescription refill", "Routine follow-up"},
 }
 
+func triageColor(t models.TriageLevel) string {
+	switch t {
+	case models.Critical:
+		return colorRed + colorBold
+	case models.Emergency:
+		return colorRed
+	case models.Urgent:
+		return colorYellow
+	case models.SemiUrgent:
+		return colorBlue
+	default:
+		return colorDim
+	}
+}
+
 func (e *Engine) patientGenerator() {
+	log.Printf("%s Goroutine started — generating patients every 2-6s (scaled by speed)", tagGenerator)
 	nameIdx := 0
 	for {
 		select {
 		case <-e.cancel:
+			log.Printf("%s Goroutine exiting", tagGenerator)
 			return
 		default:
 		}
 
-		// Random arrival interval: 2-6 seconds (scaled by speed)
 		delay := time.Duration(2000+rand.Intn(4000)) * time.Millisecond
 		e.scaledSleep(delay)
 
@@ -175,7 +210,6 @@ func (e *Engine) patientGenerator() {
 		default:
 		}
 
-		// Pick a random triage level (weighted: more non-urgent than critical)
 		triage := weightedTriage()
 		name := patientNames[nameIdx%len(patientNames)]
 		nameIdx++
@@ -190,7 +224,15 @@ func (e *Engine) patientGenerator() {
 
 		e.mu.Lock()
 		e.totalArrivals++
+		arrivals := e.totalArrivals
 		e.mu.Unlock()
+
+		qLen := e.store.Queue.Len()
+		tc := triageColor(triage)
+		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total arrivals: %d)",
+			tagGenerator, colorGreen, name, colorReset,
+			complaint, tc, p.TriageLevelName, colorReset,
+			p.EffectivePri, qLen, arrivals)
 
 		e.store.AddEvent("patient.arrival",
 			fmt.Sprintf("NEW ARRIVAL: %s — %s [%s, priority %d]", p.Name, complaint, p.TriageLevelName, p.EffectivePri),
@@ -200,8 +242,6 @@ func (e *Engine) patientGenerator() {
 	}
 }
 
-// weightedTriage returns a random triage level, weighted realistically.
-// Critical: 5%, Emergency: 10%, Urgent: 25%, Semi-Urgent: 35%, Non-Urgent: 25%
 func weightedTriage() models.TriageLevel {
 	r := rand.Intn(100)
 	switch {
@@ -218,14 +258,17 @@ func weightedTriage() models.TriageLevel {
 	}
 }
 
-// --- GOROUTINE 2: Scheduler Loop ---
-// Continuously assigns waiting patients to available beds and doctors.
-// OS parallel: the CPU scheduler's main loop — pick highest priority, assign to core.
+// =====================================================================
+// GOROUTINE 2: Scheduler Loop
+// OS concept: CPU scheduler — picks highest-priority process from ready queue
+// =====================================================================
 
 func (e *Engine) schedulerLoop() {
+	log.Printf("%s Goroutine started — scheduling every 800ms (scaled by speed)", tagScheduler)
 	for {
 		select {
 		case <-e.cancel:
+			log.Printf("%s Goroutine exiting", tagScheduler)
 			return
 		default:
 		}
@@ -238,7 +281,6 @@ func (e *Engine) schedulerLoop() {
 		default:
 		}
 
-		// Try to assign the highest-priority waiting patient to a bed
 		next := e.store.Queue.Peek()
 		if next == nil {
 			continue
@@ -246,8 +288,11 @@ func (e *Engine) schedulerLoop() {
 
 		bed := e.store.FindAvailableBed("")
 		if bed == nil {
-			// No beds — check if preemption is needed for critical patients
+			// No beds available
 			if next.TriageLevel == models.Critical {
+				log.Printf("%s %s⚠ No beds for CRITICAL patient %s — attempting PREEMPTION%s",
+					tagScheduler, colorRed+colorBold, next.Name, colorReset)
+
 				results := scheduler.CheckPreemption(
 					e.store.Queue,
 					e.store.GetAllPatients(),
@@ -257,18 +302,28 @@ func (e *Engine) schedulerLoop() {
 				for _, pr := range results {
 					e.mu.Lock()
 					e.totalPreemptions++
+					preemptions := e.totalPreemptions
 					e.mu.Unlock()
-					e.store.AddEvent("preemption",
-						scheduler.FormatPreemptionMessage(pr),
-						"preemption",
-						pr,
-					)
+
+					log.Printf("%s %s⚡ PREEMPTION #%d: %s (pri=%d) BUMPED %s (pri=%d) from bed %s%s",
+						tagPreemption, colorRed+colorBold, preemptions,
+						pr.IncomingPatientName, pr.IncomingPriority,
+						pr.PreemptedPatientName, pr.PreemptedPriority,
+						pr.BedID, colorReset)
+
+					e.store.AddEvent("preemption", scheduler.FormatPreemptionMessage(pr), "preemption", pr)
 				}
+				if len(results) == 0 {
+					log.Printf("%s %s✗ Preemption failed — no lower-priority patients to bump%s",
+						tagScheduler, colorRed, colorReset)
+				}
+			} else {
+				log.Printf("%s All beds full — %s (pri=%d) stays in queue (pos: queue has %d waiting)",
+					tagScheduler, next.Name, next.EffectivePri, e.store.Queue.Len())
 			}
 			continue
 		}
 
-		// Dequeue and assign
 		patient := e.store.Queue.Dequeue()
 		if patient == nil {
 			continue
@@ -276,20 +331,27 @@ func (e *Engine) schedulerLoop() {
 
 		ok, _ := e.store.AssignBedSafe(bed.ID, patient.ID)
 		if !ok {
-			// Bed was taken between Peek and now — re-enqueue
 			e.store.Queue.Enqueue(patient)
+			log.Printf("%s Bed %s was taken (race avoided by mutex) — %s re-queued",
+				tagScheduler, bed.ID, patient.Name)
 			continue
 		}
 
 		patient.Status = models.StatusInTreatment
 
-		// Assign a doctor
 		doc := e.store.FindAvailableDoctor()
-		docName := "awaiting doctor"
+		docName := "no doctor available"
 		if doc != nil {
 			_ = e.store.AssignDoctor(doc.ID, patient.ID)
 			docName = doc.Name
 		}
+
+		tc := triageColor(patient.TriageLevel)
+		log.Printf("%s %s→ ASSIGNED:%s %s → %sBed %s%s + %s [%s%s%s, pri=%d]",
+			tagScheduler, colorGreen, colorReset,
+			patient.Name, colorCyan, bed.ID, colorReset,
+			docName, tc, patient.TriageLevelName, colorReset,
+			patient.EffectivePri)
 
 		concept := "priority-scheduling"
 		if patient.TriageLevel == models.Critical {
@@ -300,23 +362,22 @@ func (e *Engine) schedulerLoop() {
 			fmt.Sprintf("SCHEDULED: %s → Bed %s, %s [%s, priority %d]",
 				patient.Name, bed.ID, docName, patient.TriageLevelName, patient.EffectivePri),
 			concept,
-			map[string]any{
-				"patientId": patient.ID,
-				"bedId":     bed.ID,
-				"doctorId":  safeDocID(doc),
-			},
+			map[string]any{"patientId": patient.ID, "bedId": bed.ID, "doctorId": safeDocID(doc)},
 		)
 	}
 }
 
-// --- GOROUTINE 3: Treatment Simulator ---
-// Tracks patients being treated and discharges them when done.
-// OS parallel: process execution — each process runs for a time quantum, then terminates.
+// =====================================================================
+// GOROUTINE 3: Treatment Simulator
+// OS concept: Process execution — each process runs for a time quantum
+// =====================================================================
 
 func (e *Engine) treatmentSimulator() {
+	log.Printf("%s Goroutine started — checking treatment completion every 1.5s", tagTreatment)
 	for {
 		select {
 		case <-e.cancel:
+			log.Printf("%s Goroutine exiting", tagTreatment)
 			return
 		default:
 		}
@@ -329,16 +390,12 @@ func (e *Engine) treatmentSimulator() {
 		default:
 		}
 
-		// Find patients being treated and check if they're "done"
 		patients := e.store.GetAllPatients()
 		for _, p := range patients {
 			if p.Status != models.StatusInTreatment {
 				continue
 			}
 
-			// Treatment time depends on severity:
-			// Critical: 15-25s, Emergency: 10-18s, Urgent: 8-14s, Semi: 6-10s, Non: 4-8s
-			// (all scaled by speed)
 			treatmentTime := treatmentDuration(p.TriageLevel)
 			elapsed := time.Since(p.CheckInTime)
 
@@ -346,7 +403,6 @@ func (e *Engine) treatmentSimulator() {
 				continue
 			}
 
-			// Discharge
 			e.dischargePatient(p)
 		}
 	}
@@ -368,12 +424,13 @@ func treatmentDuration(triage models.TriageLevel) time.Duration {
 }
 
 func (e *Engine) dischargePatient(p *models.Patient) {
-	// Release bed
+	bedID := p.AssignedBed
+	docID := p.AssignedDoc
+
 	if p.AssignedBed != "" {
 		_, _ = e.store.ReleaseBed(p.AssignedBed)
 	}
 
-	// Remove from doctor
 	if p.AssignedDoc != "" {
 		if doc, ok := e.store.GetDoctor(p.AssignedDoc); ok {
 			removeFromSlice(&doc.PatientIDs, p.ID)
@@ -389,7 +446,16 @@ func (e *Engine) dischargePatient(p *models.Patient) {
 
 	e.mu.Lock()
 	e.totalDischarged++
+	discharged := e.totalDischarged
 	e.mu.Unlock()
+
+	elapsed := time.Since(p.CheckInTime).Round(time.Second)
+	tc := triageColor(p.TriageLevel)
+	log.Printf("%s %s✓ DISCHARGED:%s %s — Bed %s freed, %s released [%s%s%s] (treated %s, total discharged: %d)",
+		tagTreatment, colorGreen, colorReset,
+		p.Name, bedID, docID,
+		tc, p.TriageLevelName, colorReset,
+		elapsed, discharged)
 
 	e.store.AddEvent("patient.discharged",
 		fmt.Sprintf("DISCHARGED: %s — treatment complete [was %s]", p.Name, p.TriageLevelName),
@@ -398,14 +464,17 @@ func (e *Engine) dischargePatient(p *models.Patient) {
 	)
 }
 
-// --- GOROUTINE 4: Aging Daemon ---
-// Periodically boosts priority of long-waiting patients.
-// OS parallel: the aging daemon in priority schedulers.
+// =====================================================================
+// GOROUTINE 4: Aging Daemon
+// OS concept: Priority aging — prevents starvation of low-priority processes
+// =====================================================================
 
 func (e *Engine) agingDaemon() {
+	log.Printf("%s Goroutine started — scanning for stale patients every 5s", tagAging)
 	for {
 		select {
 		case <-e.cancel:
+			log.Printf("%s Goroutine exiting", tagAging)
 			return
 		default:
 		}
@@ -420,13 +489,18 @@ func (e *Engine) agingDaemon() {
 
 		patients := e.store.GetAllPatients()
 		results := scheduler.ApplyAging(e.store.Queue, patients, 0)
-		for _, ar := range results {
-			e.store.AddEvent("aging",
-				fmt.Sprintf("AGING: %s priority %d → %d (waited %dm)",
-					ar.PatientName, ar.OldPriority, ar.NewPriority, ar.WaitMinutes),
-				"aging",
-				ar,
-			)
+		if len(results) > 0 {
+			log.Printf("%s %s↑ AGING PASS: %d patient(s) boosted:%s",
+				tagAging, colorYellow, len(results), colorReset)
+			for _, ar := range results {
+				log.Printf("%s   %s: priority %d → %d (waited %dm)",
+					tagAging, ar.PatientName, ar.OldPriority, ar.NewPriority, ar.WaitMinutes)
+				e.store.AddEvent("aging",
+					fmt.Sprintf("AGING: %s priority %d → %d (waited %dm)",
+						ar.PatientName, ar.OldPriority, ar.NewPriority, ar.WaitMinutes),
+					"aging", ar,
+				)
+			}
 		}
 	}
 }
