@@ -249,10 +249,40 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 
 	var raceDetected string
 	if bothClaimedSuccess {
-		raceDetected = fmt.Sprintf("RACE DETECTED: Both %s and %s were told they got bed %s, but only %s actually has it. The other patient's assignment was silently overwritten — a classic lost-update bug.",
+		raceDetected = fmt.Sprintf("RACE DETECTED: Both %s and %s were told they got bed %s, but only %s actually has it — a classic lost-update bug.",
 			results[0].patientName, results[1].patientName, freeBed.ID, actualOwner)
+
+		// --- RESOLUTION: Fix the inconsistent state using the mutex (the safe path) ---
+		// The loser is the patient who thinks they have the bed but doesn't.
+		loserID := results[0].patientID
+		loserName := results[0].patientName
+		if actualOwner == results[0].patientID {
+			loserID = results[1].patientID
+			loserName = results[1].patientName
+		}
+
+		// ReleaseBed clears the bed AND resets the current occupant's state
+		h.store.ReleaseBed(freeBed.ID)
+
+		// Re-assign the bed to the winner using the mutex-protected path
+		h.store.AssignBedSafe(freeBed.ID, actualOwner)
+		if winner, ok := h.store.GetPatient(actualOwner); ok {
+			winner.Status = models.StatusInTreatment
+		}
+
+		// Put the loser back in the queue so they can be assigned properly
+		if loser, ok := h.store.GetPatient(loserID); ok {
+			loser.Status = models.StatusWaiting
+			loser.AssignedBed = ""
+			h.store.Queue.Enqueue(loser)
+		}
+		h.store.AddEvent("simulation.race-condition.resolved",
+			fmt.Sprintf("MUTEX FIX: Race resolved — bed %s re-assigned safely with mutex lock. %s returned to queue.", freeBed.ID, loserName),
+			"mutex",
+			map[string]any{"winnerId": actualOwner, "loserId": loserID, "bedId": freeBed.ID},
+		)
 	} else {
-		raceDetected = fmt.Sprintf("Race did not manifest this time (timing-dependent). Patient %s got the bed. In production, this bug would appear intermittently — the worst kind.", actualOwner)
+		raceDetected = fmt.Sprintf("Race did not manifest this time (timing-dependent). Patient %s got the bed. In production, this bug would appear intermittently.", actualOwner)
 	}
 
 	h.store.AddEvent("simulation.race-condition.result",
@@ -275,6 +305,7 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 		"actualOwner":         actualOwner,
 		"bothClaimedSuccess":  bothClaimedSuccess,
 		"raceDetected":        bothClaimedSuccess,
+		"resolved":            bothClaimedSuccess,
 		"explanation":         raceDetected,
 		"patient1Result":      results[0].success,
 		"patient2Result":      results[1].success,
