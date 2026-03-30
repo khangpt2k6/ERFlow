@@ -78,8 +78,39 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			r.Get("/status", eh.Status)
 		})
 
-		// System state
-		r.Get("/system/state", ph.SystemState)
+		// System state — includes engine status
+		r.Get("/system/state", func(w http.ResponseWriter, _ *http.Request) {
+			patients := s.GetAllPatients()
+			// Count by status
+			var waiting, treating, discharged int
+			for _, p := range patients {
+				switch p.Status {
+				case "waiting":
+					waiting++
+				case "assigned", "in-treatment":
+					treating++
+				case "discharged":
+					discharged++
+				}
+			}
+			state := map[string]any{
+				"patients":   patients,
+				"beds":       s.GetAllBeds(),
+				"doctors":    s.GetAllDoctors(),
+				"queue":      s.Queue.All(),
+				"queueLen":   s.Queue.Len(),
+				"events":     s.GetEvents(),
+				"engine":     eng.Stats(),
+				"counts": map[string]int{
+					"waiting":    waiting,
+					"treating":   treating,
+					"discharged": discharged,
+					"total":      len(patients),
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(state)
+		})
 	})
 
 	return r
