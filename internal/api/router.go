@@ -8,10 +8,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/erflow/backend/internal/engine"
 	"github.com/erflow/backend/internal/store"
 )
 
-func NewRouter(s *store.MemStore) *chi.Mux {
+func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Logger)
@@ -26,6 +27,7 @@ func NewRouter(s *store.MemStore) *chi.Mux {
 	ph := &PatientHandler{store: s}
 	bh := &BedHandler{store: s}
 	sh := &SimulationHandler{store: s}
+	eh := &EngineHandler{engine: eng}
 
 	r.Route("/api", func(r chi.Router) {
 		// Patient routes
@@ -38,7 +40,7 @@ func NewRouter(s *store.MemStore) *chi.Mux {
 			r.Delete("/{id}", ph.Discharge)
 		})
 
-		// Bed routes — safe (mutex) and unsafe (racy) assignment
+		// Bed routes
 		r.Route("/beds", func(r chi.Router) {
 			r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -49,16 +51,16 @@ func NewRouter(s *store.MemStore) *chi.Mux {
 			r.Post("/{id}/release", bh.Release)
 		})
 
-		// Doctors — returns current state
+		// Doctors
 		r.Get("/doctors", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(s.GetAllDoctors())
 		})
 
-		// Events — the OS audit log
+		// Events
 		r.Get("/events", sh.Events)
 
-		// Simulation endpoints — trigger OS concept demos
+		// Simulation scenarios
 		r.Route("/simulate", func(r chi.Router) {
 			r.Post("/rush-hour", sh.RushHour)
 			r.Post("/cardiac-cascade", sh.CardiacCascade)
@@ -68,7 +70,15 @@ func NewRouter(s *store.MemStore) *chi.Mux {
 			r.Post("/reset", sh.Reset)
 		})
 
-		// System state — full snapshot
+		// Engine controls (auto-simulation)
+		r.Route("/engine", func(r chi.Router) {
+			r.Post("/start", eh.Start)
+			r.Post("/stop", eh.Stop)
+			r.Post("/speed", eh.Speed)
+			r.Get("/status", eh.Status)
+		})
+
+		// System state
 		r.Get("/system/state", ph.SystemState)
 	})
 
