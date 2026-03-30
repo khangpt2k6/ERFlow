@@ -24,9 +24,11 @@ func NewRouter(s *store.MemStore) *chi.Mux {
 	}))
 
 	ph := &PatientHandler{store: s}
+	bh := &BedHandler{store: s}
+	sh := &SimulationHandler{store: s}
 
 	r.Route("/api", func(r chi.Router) {
-		// Patient routes — Phase 1
+		// Patient routes
 		r.Route("/patients", func(r chi.Router) {
 			r.Post("/", ph.CheckIn)
 			r.Get("/", ph.List)
@@ -36,16 +38,34 @@ func NewRouter(s *store.MemStore) *chi.Mux {
 			r.Delete("/{id}", ph.Discharge)
 		})
 
-		// Beds — returns current state
-		r.Get("/beds", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(s.GetAllBeds())
+		// Bed routes — safe (mutex) and unsafe (racy) assignment
+		r.Route("/beds", func(r chi.Router) {
+			r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(s.GetAllBeds())
+			})
+			r.Post("/{id}/assign", bh.AssignSafe)
+			r.Post("/{id}/assign-unsafe", bh.AssignUnsafe)
+			r.Post("/{id}/release", bh.Release)
 		})
 
 		// Doctors — returns current state
 		r.Get("/doctors", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(s.GetAllDoctors())
+		})
+
+		// Events — the OS audit log
+		r.Get("/events", sh.Events)
+
+		// Simulation endpoints — trigger OS concept demos
+		r.Route("/simulate", func(r chi.Router) {
+			r.Post("/rush-hour", sh.RushHour)
+			r.Post("/cardiac-cascade", sh.CardiacCascade)
+			r.Post("/race-condition", sh.RaceCondition)
+			r.Post("/aging", sh.Aging)
+			r.Post("/preemption", sh.Preemption)
+			r.Post("/reset", sh.Reset)
 		})
 
 		// System state — full snapshot

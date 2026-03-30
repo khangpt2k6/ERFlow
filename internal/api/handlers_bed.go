@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/erflow/backend/internal/models"
 	"github.com/erflow/backend/internal/store"
 )
 
@@ -27,7 +28,7 @@ import (
 //   Thread A: reads bed.Occupied == false
 //   Thread B: reads bed.Occupied == false  (same bed!)
 //   Thread A: sets bed.Occupied = true, assigns patient A
-//   Thread B: sets bed.Occupied = true, assigns patient B  ← overwrites A!
+//   Thread B: sets bed.Occupied = true, assigns patient B  <- overwrites A!
 //
 // Patient A thinks they have a bed, but patient B actually has it. Classic race.
 // =============================================================================
@@ -95,7 +96,7 @@ func (h *BedHandler) AssignSafe(w http.ResponseWriter, r *http.Request) {
 	h.store.AddEvent("bed.assigned", fmt.Sprintf("Bed %s assigned to %s (mutex held — atomic check-and-set). Doctor: %s", bedID, patient.Name, docName), "mutex", map[string]any{
 		"bedId":     bedID,
 		"patientId": req.PatientID,
-		"doctorId":  docIDOrEmpty(doc),
+		"doctorId":  safeDocID(doc),
 		"safe":      true,
 	})
 
@@ -176,7 +177,7 @@ func (h *BedHandler) Release(w http.ResponseWriter, r *http.Request) {
 
 	h.store.AddEvent("bed.released", msg, "resource-management", map[string]any{
 		"bedId":     bedID,
-		"patientId": patientIDOrEmpty(released),
+		"patientId": safePatientID(released),
 	})
 
 	w.Header().Set("Content-Type", "application/json")

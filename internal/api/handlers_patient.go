@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -48,6 +49,18 @@ func (h *PatientHandler) CheckIn(w http.ResponseWriter, r *http.Request) {
 	// Add to the store (process table) and the priority queue (ready queue)
 	h.store.AddPatient(patient)
 	h.store.Queue.Enqueue(patient)
+
+	// Emit an event — every check-in is a new process entering the ready queue
+	h.store.AddEvent("patient.checkin",
+		fmt.Sprintf("%s checked in — Triage: %s (priority %d). Queued for scheduling.", patient.Name, patient.TriageLevelName, patient.EffectivePri),
+		"priority-scheduling",
+		map[string]any{
+			"patientId":   patient.ID,
+			"triageLevel": int(patient.TriageLevel),
+			"priority":    patient.EffectivePri,
+			"complaint":   patient.Complaint,
+		},
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -140,6 +153,7 @@ func (h *PatientHandler) SystemState(w http.ResponseWriter, r *http.Request) {
 		"doctors":  h.store.GetAllDoctors(),
 		"queue":    h.store.Queue.All(),
 		"queueLen": h.store.Queue.Len(),
+		"events":   h.store.GetEvents(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(state)
