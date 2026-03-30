@@ -149,16 +149,6 @@ func (s *MemStore) GetAllPatients() []*models.Patient {
 	return result
 }
 
-// GetAllPatientsUnsafe returns all patients WITHOUT acquiring the lock.
-// Only call this when you already hold the lock externally.
-func (s *MemStore) GetAllPatientsUnsafe() []*models.Patient {
-	result := make([]*models.Patient, 0, len(s.patients))
-	for _, p := range s.patients {
-		result = append(result, p)
-	}
-	return result
-}
-
 func (s *MemStore) NextPatientID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
