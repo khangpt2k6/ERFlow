@@ -151,10 +151,7 @@ func (e *Engine) scaledSleep(base time.Duration) {
 	}
 }
 
-// =====================================================================
-// GOROUTINE 1: Patient Generator
-// OS concept: Hardware interrupts — new work arriving in the system
-// =====================================================================
+// patientGenerator spawns new patients at random intervals.
 
 var patientNames = []string{
 	"Sarah Mitchell", "Miguel Santos", "Aiko Tanaka", "James O'Brien",
@@ -258,10 +255,7 @@ func weightedTriage() models.TriageLevel {
 	}
 }
 
-// =====================================================================
-// GOROUTINE 2: Scheduler Loop
-// OS concept: CPU scheduler — picks highest-priority process from ready queue
-// =====================================================================
+// schedulerLoop picks the highest-priority patient and assigns them a bed.
 
 func (e *Engine) schedulerLoop() {
 	log.Printf("%s Goroutine started — scheduling every 800ms (scaled by speed)", tagScheduler)
@@ -288,7 +282,6 @@ func (e *Engine) schedulerLoop() {
 
 		bed := e.store.FindAvailableBed("")
 		if bed == nil {
-			// No beds available
 			if next.TriageLevel == models.Critical {
 				log.Printf("%s %s⚠ No beds for CRITICAL patient %s — attempting PREEMPTION%s",
 					tagScheduler, colorRed+colorBold, next.Name, colorReset)
@@ -367,10 +360,7 @@ func (e *Engine) schedulerLoop() {
 	}
 }
 
-// =====================================================================
-// GOROUTINE 3: Treatment Simulator
-// OS concept: Process execution — each process runs for a time quantum
-// =====================================================================
+// treatmentSimulator discharges patients after their treatment time elapses.
 
 func (e *Engine) treatmentSimulator() {
 	log.Printf("%s Goroutine started — checking treatment completion every 1.5s", tagTreatment)
@@ -464,10 +454,7 @@ func (e *Engine) dischargePatient(p *models.Patient) {
 	)
 }
 
-// =====================================================================
-// GOROUTINE 4: Aging Daemon
-// OS concept: Priority aging — prevents starvation of low-priority processes
-// =====================================================================
+// agingDaemon periodically boosts priority of patients who've been waiting too long.
 
 func (e *Engine) agingDaemon() {
 	log.Printf("%s Goroutine started — scanning for stale patients every 5s", tagAging)

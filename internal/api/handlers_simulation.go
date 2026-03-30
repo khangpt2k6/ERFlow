@@ -13,23 +13,12 @@ import (
 	"github.com/erflow/backend/internal/store"
 )
 
-// =============================================================================
-// SIMULATION ENDPOINTS
-// =============================================================================
-//
-// These endpoints trigger real OS scenarios against the ER system so you can
-// observe scheduling, preemption, aging, mutex behavior, and race conditions
-// in action. Every action emits events tagged with the OS concept it demonstrates.
-// =============================================================================
 
 type SimulationHandler struct {
 	store *store.MemStore
 }
 
-// --- POST /api/simulate/rush-hour ---
-// Adds 8-10 patients of mixed triage levels rapidly.
-// OS concept: process burst — many processes arriving at once stress-tests the scheduler.
-
+// POST /api/simulate/rush-hour — adds 10 patients of mixed triage levels.
 func (h *SimulationHandler) RushHour(w http.ResponseWriter, r *http.Request) {
 	type rushPatient struct {
 		Name      string
@@ -50,7 +39,7 @@ func (h *SimulationHandler) RushHour(w http.ResponseWriter, r *http.Request) {
 		{"Marcus Johnson", models.Urgent, "Allergic reaction, facial swelling"},
 	}
 
-	// Shuffle to simulate unpredictable arrival order
+	// Shuffle arrival order
 	rand.Shuffle(len(incoming), func(i, j int) {
 		incoming[i], incoming[j] = incoming[j], incoming[i]
 	})
@@ -80,7 +69,7 @@ func (h *SimulationHandler) RushHour(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	// Show the resulting queue order
+	// Queue order after insertion
 	queued := h.store.Queue.All()
 	queueOrder := make([]string, len(queued))
 	for i, p := range queued {
@@ -103,8 +92,7 @@ func (h *SimulationHandler) RushHour(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- POST /api/simulate/cardiac-cascade ---
-// Adds 3 Critical patients rapidly. If beds are full, triggers preemption.
+// POST /api/simulate/cardiac-cascade — 3 Critical patients, triggers preemption if beds full.
 
 func (h *SimulationHandler) CardiacCascade(w http.ResponseWriter, r *http.Request) {
 	criticals := []struct {
@@ -141,7 +129,7 @@ func (h *SimulationHandler) CardiacCascade(w http.ResponseWriter, r *http.Reques
 		)
 	}
 
-	// Attempt preemption for each critical patient
+	// Run preemption check
 	preemptionResults := scheduler.CheckPreemption(
 		h.store.Queue,
 		h.store.GetAllPatients(),
@@ -175,18 +163,15 @@ func (h *SimulationHandler) CardiacCascade(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// --- POST /api/simulate/race-condition ---
-// Fires 2 simultaneous unsafe bed assignments to the same bed using goroutines.
+// POST /api/simulate/race-condition — 2 goroutines race for the same bed without a lock.
 
 func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request) {
-	// Find a free bed
 	freeBed := h.store.FindAvailableBed("")
 	if freeBed == nil {
 		http.Error(w, "no free beds available to demonstrate race condition", http.StatusConflict)
 		return
 	}
 
-	// Create two patients who will race for the same bed
 	id1 := h.store.NextPatientID()
 	p1 := models.NewPatient(id1, "Liam Foster", models.Urgent, "Deep cut on hand — needs stitches")
 	h.store.AddPatient(p1)
@@ -207,7 +192,6 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 		},
 	)
 
-	// Fire two goroutines that both try to assign the same bed without locking
 	var wg sync.WaitGroup
 	type raceResult struct {
 		patientID   string
@@ -231,11 +215,8 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 	}()
 	wg.Wait()
 
-	// Check who actually got the bed
 	bed, _ := h.store.GetBed(freeBed.ID)
 	actualOwner := bed.PatientID
-
-	// Both may report success (that's the bug!)
 	bothClaimedSuccess := results[0].success && results[1].success
 
 	for _, res := range results {
@@ -252,8 +233,7 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 		raceDetected = fmt.Sprintf("RACE DETECTED: Both %s and %s were told they got bed %s, but only %s actually has it — a classic lost-update bug.",
 			results[0].patientName, results[1].patientName, freeBed.ID, actualOwner)
 
-		// --- RESOLUTION: Fix the inconsistent state using the mutex (the safe path) ---
-		// The loser is the patient who thinks they have the bed but doesn't.
+		// Resolve: figure out who lost, fix state with the mutex
 		loserID := results[0].patientID
 		loserName := results[0].patientName
 		if actualOwner == results[0].patientID {
@@ -261,16 +241,12 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 			loserName = results[1].patientName
 		}
 
-		// ReleaseBed clears the bed AND resets the current occupant's state
 		h.store.ReleaseBed(freeBed.ID)
-
-		// Re-assign the bed to the winner using the mutex-protected path
 		h.store.AssignBedSafe(freeBed.ID, actualOwner)
 		if winner, ok := h.store.GetPatient(actualOwner); ok {
 			winner.Status = models.StatusInTreatment
 		}
 
-		// Put the loser back in the queue so they can be assigned properly
 		if loser, ok := h.store.GetPatient(loserID); ok {
 			loser.Status = models.StatusWaiting
 			loser.AssignedBed = ""
@@ -312,8 +288,7 @@ func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// --- POST /api/simulate/aging ---
-// Artificially ages all waiting patients by 2 hours to demonstrate priority boosting.
+// POST /api/simulate/aging — fast-forwards wait time by 2 hours, boosting priorities.
 
 func (h *SimulationHandler) Aging(w http.ResponseWriter, r *http.Request) {
 	patients := h.store.GetAllPatients()
@@ -351,7 +326,7 @@ func (h *SimulationHandler) Aging(w http.ResponseWriter, r *http.Request) {
 		map[string]any{"boostCount": len(results), "results": results},
 	)
 
-	// Show new queue order
+	// New queue order after aging
 	queued := h.store.Queue.All()
 	queueOrder := make([]string, len(queued))
 	for i, p := range queued {
@@ -369,12 +344,9 @@ func (h *SimulationHandler) Aging(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- POST /api/simulate/preemption ---
-// Adds a Critical patient when beds are full with lower-priority patients.
-// First fills beds if needed, then adds the Critical patient and triggers preemption.
+// POST /api/simulate/preemption — fills beds, then adds a Critical patient to trigger preemption.
 
 func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
-	// Step 1: Fill all beds with low-priority patients if not already full
 	fillerPatients := []struct {
 		Name      string
 		Triage    models.TriageLevel
@@ -406,7 +378,7 @@ func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
 		nil,
 	)
 
-	// Assign filler patients to all available beds
+	// Fill available beds
 	bedsAssigned := 0
 	for {
 		bed := h.store.FindAvailableBed("")
@@ -423,11 +395,9 @@ func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
 
 		ok, _ := h.store.AssignBedSafe(bed.ID, p.ID)
 		if ok {
-			// Mark as in-treatment so preemption can find them
 			p.Status = models.StatusInTreatment
 			bedsAssigned++
 
-			// Try to assign a doctor
 			doc := h.store.FindAvailableDoctor()
 			if doc != nil {
 				_ = h.store.AssignDoctor(doc.ID, p.ID)
@@ -441,7 +411,7 @@ func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 2: Now add a Critical patient
+	// Add critical patient
 	critID := h.store.NextPatientID()
 	critPatient := models.NewPatient(critID, "Kenji Nakamura", models.Critical, "Massive internal bleeding — motorcycle accident, losing consciousness")
 	h.store.AddPatient(critPatient)
@@ -454,7 +424,7 @@ func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
 		map[string]any{"patientId": critPatient.ID, "bedsOccupied": bedsAssigned},
 	)
 
-	// Step 3: Run preemption
+	// Run preemption
 	preemptionResults := scheduler.CheckPreemption(
 		h.store.Queue,
 		h.store.GetAllPatients(),
@@ -490,9 +460,6 @@ func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- GET /api/events ---
-// Returns the full event log.
-
 func (h *SimulationHandler) Events(w http.ResponseWriter, r *http.Request) {
 	events := h.store.GetEvents()
 	w.Header().Set("Content-Type", "application/json")
@@ -501,9 +468,6 @@ func (h *SimulationHandler) Events(w http.ResponseWriter, r *http.Request) {
 		"count":  len(events),
 	})
 }
-
-// --- POST /api/simulate/reset ---
-// Clears all state and reinitializes the ER.
 
 func (h *SimulationHandler) Reset(w http.ResponseWriter, r *http.Request) {
 	h.store.Reset()
