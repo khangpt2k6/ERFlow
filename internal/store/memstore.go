@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -136,6 +137,7 @@ func (s *MemStore) GetAllPatients() []*models.Patient {
 	for _, p := range s.patients {
 		result = append(result, p)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	return result
 }
 
@@ -153,6 +155,7 @@ func (s *MemStore) GetAllBeds() []*models.Bed {
 	for _, b := range s.beds {
 		result = append(result, b)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	return result
 }
 
@@ -300,6 +303,7 @@ func (s *MemStore) GetAllDoctors() []*models.Doctor {
 	for _, d := range s.doctors {
 		result = append(result, d)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	return result
 }
 

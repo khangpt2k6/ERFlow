@@ -105,9 +105,9 @@ func (e *Engine) Start() {
 		map[string]any{"speed": e.speed},
 	)
 
-	// Create worker pool — one worker per doctor
+	// Create worker pool — one goroutine per doctor (bounded concurrency)
 	numDoctors := len(e.store.GetAllDoctors())
-	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep)
+	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep, &e.totalContextSwitches, e.thrashing)
 	e.pool.Start(ctx)
 
 	e.wg.Add(5)
@@ -530,8 +530,8 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 				}
 			}
 
-			// Normal completion: check if treatment is done
-			if p.RemainingTreatment <= elapsed {
+			// Normal completion: RemainingTreatment was computed above as EstimatedDuration - elapsed
+			if p.RemainingTreatment <= 0 {
 				d := discharge{patient: p, bedID: p.AssignedBed, docID: p.AssignedDoc}
 				e.processDischarge(d)
 

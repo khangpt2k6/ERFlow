@@ -39,6 +39,12 @@ type WorkerPool struct {
 	store          *store.MemStore
 	scaledSleepFn  func(ctx context.Context, base time.Duration) bool
 	wg             sync.WaitGroup
+
+	// Context switch tracking — shared with engine
+	totalContextSwitches *atomic.Int64
+
+	// Thrashing reference — applies overhead multiplier
+	thrashing *ThrashingMonitor
 }
 
 // NewWorkerPool creates a pool with one goroutine per doctor.
@@ -47,13 +53,17 @@ func NewWorkerPool(
 	results chan discharge,
 	st *store.MemStore,
 	sleepFn func(ctx context.Context, base time.Duration) bool,
+	ctxSwitches *atomic.Int64,
+	thrashing *ThrashingMonitor,
 ) *WorkerPool {
 	return &WorkerPool{
-		jobs:          make(chan TreatmentJob, numWorkers*2), // buffer = 2x workers
-		results:       results,
-		workers:       numWorkers,
-		store:         st,
-		scaledSleepFn: sleepFn,
+		jobs:                 make(chan TreatmentJob, numWorkers*2),
+		results:              results,
+		workers:              numWorkers,
+		store:                st,
+		scaledSleepFn:        sleepFn,
+		totalContextSwitches: ctxSwitches,
+		thrashing:            thrashing,
 	}
 }
 
@@ -72,7 +82,7 @@ func (wp *WorkerPool) Stop() {
 	wp.wg.Wait()
 }
 
-// Submit sends a job to the pool. Non-blocking if channel has room.
+// Submit sends a job to the pool. Non-blocking — returns false if channel is full.
 func (wp *WorkerPool) Submit(job TreatmentJob) bool {
 	select {
 	case wp.jobs <- job:
@@ -93,7 +103,8 @@ func (wp *WorkerPool) Stats() WorkerPoolStats {
 }
 
 // worker is the goroutine function — one per doctor.
-// Reads TreatmentJobs from the shared channel, simulates treatment, sends discharges.
+// Reads TreatmentJobs from the shared channel, handles context switch overhead,
+// applies thrashing multiplier, then simulates treatment.
 func (wp *WorkerPool) worker(ctx context.Context, id int) {
 	defer wp.wg.Done()
 
@@ -115,22 +126,56 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 
 func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 	p := job.Patient
+	doc, _ := wp.store.GetDoctor(job.DoctorID)
 
-	// Mark doctor as busy
-	if doc, ok := wp.store.GetDoctor(job.DoctorID); ok {
+	if doc != nil {
 		doc.Busy = true
+
+		// --- Context Switch Overhead ---
+		// If this doctor was treating a different patient, there's overhead
+		// for switching context (reviewing new chart, setting up, etc.)
+		if doc.LastPatientID != "" && doc.LastPatientID != p.ID {
+			doc.ContextSwitches++
+			wp.totalContextSwitches.Add(1)
+
+			overhead := 2 * time.Second // base context switch cost
+			log.Printf("%s %s⇄ CONTEXT SWITCH:%s %s switching from %s to %s (overhead: %v)",
+				tagTreatment, colorYellow, colorReset,
+				doc.Name, doc.LastPatientID, p.ID, overhead)
+
+			wp.store.AddEvent("context-switch",
+				fmt.Sprintf("CONTEXT SWITCH: %s switching patients (overhead %v) — switches: %d",
+					doc.Name, overhead, doc.ContextSwitches),
+				"context-switch",
+				map[string]any{
+					"doctorId":  doc.ID,
+					"fromPatient": doc.LastPatientID,
+					"toPatient":   p.ID,
+					"switches":    doc.ContextSwitches,
+				},
+			)
+
+			wp.scaledSleepFn(ctx, overhead) // actual delay
+		}
+		doc.LastPatientID = p.ID
 	}
 
-	// Simulate treatment by sleeping for the remaining treatment duration
+	// --- Treatment Duration with Thrashing Multiplier ---
 	duration := p.RemainingTreatment
 	if duration <= 0 {
 		duration = p.EstimatedDuration
 	}
 
+	// Apply thrashing overhead — when system is thrashing, treatment takes longer
+	multiplier := wp.thrashing.OverheadMultiplier()
+	if multiplier > 1.0 {
+		duration = time.Duration(float64(duration) * multiplier)
+	}
+
 	wp.scaledSleepFn(ctx, duration)
 
-	// Mark doctor as idle
-	if doc, ok := wp.store.GetDoctor(job.DoctorID); ok {
+	// Mark doctor done
+	if doc != nil {
 		doc.Busy = false
 		doc.TotalTreated++
 	}
@@ -141,9 +186,4 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 	case wp.results <- d:
 	case <-ctx.Done():
 	}
-}
-
-func formatPoolEvent(stats WorkerPoolStats) string {
-	return fmt.Sprintf("Worker pool: %d/%d active, %d queued, %d completed",
-		stats.ActiveJobs, stats.Workers, stats.QueuedJobs, stats.TotalCompleted)
 }
