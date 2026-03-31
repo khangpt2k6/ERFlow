@@ -271,10 +271,7 @@ func (e *Engine) patientGenerator(ctx context.Context) {
 		e.store.AddPatient(p)
 		e.store.Queue.Enqueue(p)
 
-		e.mu.Lock()
-		e.totalArrivals++
-		arrivals := e.totalArrivals
-		e.mu.Unlock()
+		arrivals := e.totalArrivals.Add(1)
 
 		tc := triageColor(triage)
 		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total: %d)",
@@ -351,10 +348,7 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 					e.store.GetDoctorsMap(),
 				)
 				for _, pr := range results {
-					e.mu.Lock()
-					e.totalPreemptions++
-					n := e.totalPreemptions
-					e.mu.Unlock()
+					n := e.totalPreemptions.Add(1)
 
 					log.Printf("%s %s⚡ PREEMPTION #%d: %s bumped %s from bed %s%s",
 						tagPreemption, colorRed+colorBold, n,
@@ -463,10 +457,7 @@ func (e *Engine) processDischarge(d discharge) {
 	p.AssignedBed = ""
 	p.AssignedDoc = ""
 
-	e.mu.Lock()
-	e.totalDischarged++
-	discharged := e.totalDischarged
-	e.mu.Unlock()
+	discharged := e.totalDischarged.Add(1)
 
 	elapsed := time.Since(p.CheckInTime).Round(time.Second)
 	tc := triageColor(p.TriageLevel)
