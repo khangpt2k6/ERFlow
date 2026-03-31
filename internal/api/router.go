@@ -30,6 +30,11 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 	eh := &EngineHandler{engine: eng}
 	sse := NewSSEHandler(s, eng)
 
+	// Wire SSE broker into the store — every AddEvent pushes to connected clients
+	s.OnEvent = func(eventType string, data any) {
+		sse.Broker.Publish(eventType, data)
+	}
+
 	r.Route("/api", func(r chi.Router) {
 		// Patient routes
 		r.Route("/patients", func(r chi.Router) {

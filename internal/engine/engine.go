@@ -110,12 +110,13 @@ func (e *Engine) Start() {
 	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep, &e.totalContextSwitches, e.thrashing)
 	e.pool.Start(ctx)
 
-	e.wg.Add(5)
+	e.wg.Add(6)
 	go e.patientGenerator(ctx)
 	go e.schedulerLoop(ctx)
 	go e.treatmentSimulator(ctx)
 	go e.agingDaemon(ctx)
 	go e.throughputTracker(ctx)
+	go e.dischargeHandler(ctx)
 }
 
 func (e *Engine) Stop() {
@@ -459,6 +460,15 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 	patient.TreatmentStarted = time.Now()
 	_ = e.store.AssignDoctor(doc.ID, patient.ID)
 
+	// Submit treatment job to worker pool — doctor goroutine handles it
+	if e.pool != nil {
+		e.pool.Submit(TreatmentJob{
+			Patient:  patient,
+			BedID:    bed.ID,
+			DoctorID: doc.ID,
+		})
+	}
+
 	tc := triageColor(patient.TriageLevel)
 	log.Printf("%s %s→ ASSIGNED:%s %s → %sBed %s%s + %s [%s%s%s, pri=%d]",
 		tagScheduler, colorGreen, colorReset,
@@ -635,6 +645,27 @@ func (e *Engine) processDischarge(d discharge) {
 		"resource-management",
 		map[string]any{"patientId": p.ID},
 	)
+}
+
+// --- Goroutine: Discharge Handler ---
+// Reads completed treatments from the worker pool's results channel
+// and processes them (free bed, remove doctor, mark discharged).
+
+func (e *Engine) dischargeHandler(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Discharge handler started — reading from worker pool results", tagTreatment)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case d, ok := <-e.discharges:
+			if !ok {
+				return
+			}
+			e.processDischarge(d)
+		}
+	}
 }
 
 // --- Goroutine 4: Aging Daemon ---

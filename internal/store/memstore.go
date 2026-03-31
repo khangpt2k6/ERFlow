@@ -33,6 +33,10 @@ type MemStore struct {
 	nextEventNum int
 
 	BedMu sync.Mutex // protects bed assignment (safe path acquires, unsafe path skips)
+
+	// SSE publish callback — set by the router to push events to connected clients.
+	// Using a callback avoids circular import (store -> api).
+	OnEvent func(eventType string, data any)
 }
 
 func NewMemStore() *MemStore {
@@ -98,6 +102,12 @@ func (s *MemStore) AddEvent(eventType, message, concept string, details any) *mo
 		Timestamp: time.Now(),
 	}
 	s.events = append(s.events, ev)
+
+	// Push to SSE clients if a publish callback is registered
+	if s.OnEvent != nil {
+		go s.OnEvent(eventType, ev)
+	}
+
 	return ev
 }
 
