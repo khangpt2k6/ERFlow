@@ -18,6 +18,11 @@ type MemStore struct {
 
 	Queue scheduler.Scheduler
 
+	// Semaphores — counting semaphores for bed types (buffered channels)
+	GeneralSem *scheduler.BedSemaphore
+	ICUSem     *scheduler.BedSemaphore
+	TraumaSem  *scheduler.BedSemaphore
+
 	nextPatientNum int
 
 	events       []*models.Event
@@ -28,10 +33,13 @@ type MemStore struct {
 
 func NewMemStore() *MemStore {
 	s := &MemStore{
-		patients: make(map[string]*models.Patient),
-		beds:     make(map[string]*models.Bed),
-		doctors:  make(map[string]*models.Doctor),
-		Queue:    scheduler.NewScheduler(scheduler.AlgoPriority),
+		patients:   make(map[string]*models.Patient),
+		beds:       make(map[string]*models.Bed),
+		doctors:    make(map[string]*models.Doctor),
+		Queue:      scheduler.NewScheduler(scheduler.AlgoPriority),
+		GeneralSem: scheduler.NewBedSemaphore("General", 10),
+		ICUSem:     scheduler.NewBedSemaphore("ICU", 5),
+		TraumaSem:  scheduler.NewBedSemaphore("Trauma", 2),
 	}
 	s.initializeER()
 	return s
@@ -152,6 +160,7 @@ func (s *MemStore) GetBed(id string) (*models.Bed, bool) {
 }
 
 // AssignBedSafe atomically checks and assigns a bed (mutex-protected).
+// Also acquires the corresponding semaphore permit.
 func (s *MemStore) AssignBedSafe(bedID, patientID string) (bool, error) {
 	s.BedMu.Lock()
 	defer s.BedMu.Unlock()
@@ -175,7 +184,31 @@ func (s *MemStore) AssignBedSafe(bedID, patientID string) (bool, error) {
 		p.AssignedBed = bedID
 	}
 
+	// Acquire semaphore permit (non-blocking since we already verified the bed is free)
+	s.semForBed(bed.Type).TryAcquire()
+
 	return true, nil
+}
+
+// semForBed returns the semaphore corresponding to a bed type.
+func (s *MemStore) semForBed(bedType models.BedType) *scheduler.BedSemaphore {
+	switch bedType {
+	case models.BedICU:
+		return s.ICUSem
+	case models.BedTrauma:
+		return s.TraumaSem
+	default:
+		return s.GeneralSem
+	}
+}
+
+// SemaphoreStats returns stats for all three bed semaphores.
+func (s *MemStore) SemaphoreStats() []scheduler.SemaphoreStats {
+	return []scheduler.SemaphoreStats{
+		s.GeneralSem.Stats(),
+		s.ICUSem.Stats(),
+		s.TraumaSem.Stats(),
+	}
 }
 
 // AssignBedUnsafe skips the mutex to demonstrate a TOCTOU race condition.
