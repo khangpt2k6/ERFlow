@@ -67,6 +67,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			r.Post("/race-condition", sh.RaceCondition)
 			r.Post("/aging", sh.Aging)
 			r.Post("/preemption", sh.Preemption)
+			r.Post("/semaphore", sh.Semaphore)
 			r.Post("/reset", sh.Reset)
 		})
 
@@ -103,6 +104,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 				"queueLen":   s.Queue.Len(),
 				"events":     s.GetEvents(),
 				"engine":     eng.Stats(),
+				"semaphores": s.SemaphoreStats(),
 				"counts": map[string]int{
 					"waiting":    waiting,
 					"treating":   treating,

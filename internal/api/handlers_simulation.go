@@ -460,6 +460,93 @@ func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /api/simulate/semaphore — floods 6 ICU-needing patients into 5 ICU beds.
+// The 6th patient visibly blocks on the semaphore.
+func (h *SimulationHandler) Semaphore(w http.ResponseWriter, r *http.Request) {
+	icuPatients := []struct {
+		Name      string
+		Complaint string
+	}{
+		{"Sarah Mitchell", "Severe cardiac arrhythmia — needs ICU monitoring"},
+		{"James O'Brien", "Post-surgical ICU recovery — unstable vitals"},
+		{"Priya Sharma", "Respiratory failure — requires ventilator in ICU"},
+		{"David Kim", "Septic shock — needs ICU-level IV antibiotics"},
+		{"Elena Volkov", "Traumatic brain injury — ICU observation required"},
+		{"Carlos Rivera", "Multi-organ failure — critical ICU admission"},
+	}
+
+	h.store.AddEvent("simulation.semaphore.start",
+		fmt.Sprintf("SEMAPHORE DEMO: %d patients need ICU — but only 5 ICU beds (semaphore capacity=5)", len(icuPatients)),
+		"semaphore",
+		map[string]any{"patientCount": len(icuPatients), "icuCapacity": 5},
+	)
+
+	assigned := 0
+	blocked := 0
+	for _, ip := range icuPatients {
+		id := h.store.NextPatientID()
+		p := models.NewPatient(id, ip.Name, models.Emergency, ip.Complaint)
+		h.store.AddPatient(p)
+
+		// Try to acquire ICU semaphore (non-blocking)
+		got := h.store.ICUSem.TryAcquire()
+		if !got {
+			blocked++
+			h.store.Queue.Enqueue(p)
+			h.store.AddEvent("semaphore.blocked",
+				fmt.Sprintf("SEMAPHORE BLOCKED: %s cannot enter ICU — all 5 permits held (sem=0). Waiting in queue.", p.Name),
+				"semaphore",
+				map[string]any{"patientId": p.ID, "semaphore": "ICU", "acquired": false},
+			)
+			continue
+		}
+
+		// Find an actual ICU bed
+		bed := h.store.FindAvailableBed(models.BedICU)
+		if bed == nil {
+			// Semaphore says yes but no physical bed — release permit back
+			h.store.ICUSem.Release()
+			h.store.Queue.Enqueue(p)
+			blocked++
+			continue
+		}
+
+		ok, _ := h.store.AssignBedSafe(bed.ID, p.ID)
+		if ok {
+			p.Status = models.StatusInTreatment
+			assigned++
+			doc := h.store.FindAvailableDoctor()
+			if doc != nil {
+				_ = h.store.AssignDoctor(doc.ID, p.ID)
+			}
+			h.store.AddEvent("semaphore.acquired",
+				fmt.Sprintf("SEMAPHORE ACQUIRED: %s got ICU bed %s — permit granted (sem=%d remaining)",
+					p.Name, bed.ID, 5-assigned),
+				"semaphore",
+				map[string]any{"patientId": p.ID, "bedId": bed.ID, "semaphore": "ICU", "remaining": 5 - assigned},
+			)
+		}
+	}
+
+	stats := h.store.ICUSem.Stats()
+	h.store.AddEvent("simulation.semaphore.complete",
+		fmt.Sprintf("Semaphore demo: %d assigned to ICU, %d blocked (sem available=%d, waiting=%d)",
+			assigned, blocked, stats.Available, stats.Waiting),
+		"semaphore",
+		map[string]any{"assigned": assigned, "blocked": blocked, "semaphoreStats": stats},
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"scenario":       "semaphore",
+		"concept":        "semaphore",
+		"assigned":       assigned,
+		"blocked":        blocked,
+		"semaphoreStats": stats,
+		"message":        fmt.Sprintf("%d patients got ICU beds, %d blocked — semaphore(5) enforces capacity", assigned, blocked),
+	})
+}
+
 func (h *SimulationHandler) Events(w http.ResponseWriter, r *http.Request) {
 	events := h.store.GetEvents()
 	w.Header().Set("Content-Type", "application/json")

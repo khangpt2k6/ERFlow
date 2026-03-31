@@ -265,8 +265,13 @@ func (s *MemStore) ReleaseBed(bedID string) (*models.Patient, error) {
 		}
 	}
 
+	bedType := bed.Type
 	bed.Occupied = false
 	bed.PatientID = ""
+
+	// Release semaphore permit — signals any blocked goroutine
+	s.semForBed(bedType).Release()
+
 	return released, nil
 }
 
@@ -373,6 +378,9 @@ func (s *MemStore) Reset() {
 	// Preserve the current algorithm across resets
 	algo := s.Queue.Name()
 	s.Queue = scheduler.NewScheduler(algo)
+	s.GeneralSem = scheduler.NewBedSemaphore("General", 10)
+	s.ICUSem = scheduler.NewBedSemaphore("ICU", 5)
+	s.TraumaSem = scheduler.NewBedSemaphore("Trauma", 2)
 	s.nextPatientNum = 0
 	s.events = nil
 	s.nextEventNum = 0
