@@ -556,6 +556,130 @@ func (h *SimulationHandler) Events(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /api/simulate/deadlock — creates a circular-wait deadlock between doctors.
+// Doctor Adams holds Lab, needs OR. Doctor Baker holds OR, needs Lab.
+// The wait-for graph detects the cycle and resolves it.
+func (h *SimulationHandler) Deadlock(w http.ResponseWriter, r *http.Request) {
+	rm := h.store.Resources
+
+	// Clear any existing resource state
+	for _, doc := range h.store.GetAllDoctors() {
+		rm.ReleaseAll(doc.ID)
+		doc.HeldResources = nil
+		doc.WaitingFor = ""
+	}
+
+	h.store.AddEvent("simulation.deadlock.start",
+		"DEADLOCK DEMO: Creating circular wait — Doctor Adams holds Lab (needs OR), Doctor Baker holds OR (needs Lab)",
+		"deadlock",
+		nil,
+	)
+
+	// Step 1: Doctor Adams acquires Lab
+	rm.TryAcquire(scheduler.ResLab, "doc-1")
+	doc1, _ := h.store.GetDoctor("doc-1")
+	if doc1 != nil {
+		doc1.HeldResources = []string{"lab"}
+	}
+	h.store.AddEvent("deadlock.acquire",
+		fmt.Sprintf("%s acquired Lab", doc1.Name),
+		"deadlock",
+		map[string]any{"doctorId": "doc-1", "resource": "lab", "action": "acquired"},
+	)
+
+	// Step 2: Doctor Baker acquires OR
+	rm.TryAcquire(scheduler.ResOR, "doc-2")
+	doc2, _ := h.store.GetDoctor("doc-2")
+	if doc2 != nil {
+		doc2.HeldResources = []string{"or"}
+	}
+	h.store.AddEvent("deadlock.acquire",
+		fmt.Sprintf("%s acquired OR", doc2.Name),
+		"deadlock",
+		map[string]any{"doctorId": "doc-2", "resource": "or", "action": "acquired"},
+	)
+
+	// Step 3: Doctor Adams requests OR (held by Baker) — will wait
+	rm.RequestAndWait(scheduler.ResOR, "doc-1")
+	if doc1 != nil {
+		doc1.WaitingFor = "or"
+	}
+	h.store.AddEvent("deadlock.wait",
+		fmt.Sprintf("%s requests OR — but %s holds it. Now waiting.", doc1.Name, doc2.Name),
+		"deadlock",
+		map[string]any{"doctorId": "doc-1", "resource": "or", "heldBy": "doc-2"},
+	)
+
+	// Step 4: Doctor Baker requests Lab (held by Adams) — DEADLOCK
+	rm.RequestAndWait(scheduler.ResLab, "doc-2")
+	if doc2 != nil {
+		doc2.WaitingFor = "lab"
+	}
+	h.store.AddEvent("deadlock.wait",
+		fmt.Sprintf("%s requests Lab — but %s holds it. CIRCULAR WAIT!", doc2.Name, doc1.Name),
+		"deadlock",
+		map[string]any{"doctorId": "doc-2", "resource": "lab", "heldBy": "doc-1"},
+	)
+
+	// Step 5: Detect the deadlock via wait-for graph
+	graph := scheduler.NewWaitForGraph()
+	graph.BuildFromResources(rm)
+	detected, cycle := graph.DetectCycle()
+
+	info := scheduler.DeadlockInfo{
+		Detected: detected,
+		Cycle:    cycle,
+	}
+
+	if detected {
+		h.store.AddEvent("deadlock.detected",
+			fmt.Sprintf("DEADLOCK DETECTED: Cycle found in wait-for graph: %v", cycle),
+			"deadlock",
+			map[string]any{"cycle": cycle, "edges": graph.Edges()},
+		)
+
+		// Step 6: Resolve — force victim to release
+		victim, action := scheduler.ResolveDeadlock(cycle, rm)
+		info.Resolved = true
+		info.Victim = victim
+
+		victimDoc, _ := h.store.GetDoctor(victim)
+		victimName := victim
+		if victimDoc != nil {
+			victimName = victimDoc.Name
+			victimDoc.HeldResources = nil
+			victimDoc.WaitingFor = ""
+		}
+
+		h.store.AddEvent("deadlock.resolved",
+			fmt.Sprintf("DEADLOCK RESOLVED: %s selected as victim — %s. Cycle broken.", victimName, action),
+			"deadlock",
+			map[string]any{"victim": victim, "action": action},
+		)
+
+		// Clean up the other doctor's waiting state since resource is now free
+		for _, doc := range h.store.GetAllDoctors() {
+			if doc.ID != victim {
+				doc.WaitingFor = ""
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"scenario":  "deadlock",
+		"concept":   "deadlock",
+		"deadlock":  info,
+		"resources": rm.Stats(),
+		"message": func() string {
+			if detected {
+				return fmt.Sprintf("Deadlock detected and resolved — victim: %s", info.Victim)
+			}
+			return "No deadlock detected"
+		}(),
+	})
+}
+
 func (h *SimulationHandler) Reset(w http.ResponseWriter, r *http.Request) {
 	h.store.Reset()
 

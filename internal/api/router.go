@@ -68,7 +68,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			r.Post("/aging", sh.Aging)
 			r.Post("/preemption", sh.Preemption)
 			r.Post("/semaphore", sh.Semaphore)
-			// r.Post("/deadlock", sh.Deadlock) // TODO: implement deadlock simulation
+			r.Post("/deadlock", sh.Deadlock)
 			r.Post("/reset", sh.Reset)
 		})
 
