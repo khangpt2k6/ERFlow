@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/erflow/backend/internal/models"
+	"github.com/erflow/backend/internal/scheduler"
 	"github.com/erflow/backend/internal/store"
 )
 
@@ -160,6 +161,23 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		doc.LastPatientID = p.ID
 	}
 
+	// Real runtime deadlock behavior:
+	// each doctor holds one resource, then may wait for another while still holding the first.
+	primaryRes, secondaryRes := resourcePlanForDoctor(job.DoctorID)
+	if !wp.acquireWithWait(ctx, doc, p, primaryRes, true) {
+		if doc != nil {
+			doc.Busy = false
+		}
+		return
+	}
+	if secondaryRes != "" && !wp.acquireWithWait(ctx, doc, p, secondaryRes, false) {
+		wp.releaseResource(doc, primaryRes, p.ID)
+		if doc != nil {
+			doc.Busy = false
+		}
+		return
+	}
+
 	// --- Treatment Duration with Thrashing Multiplier ---
 	duration := p.RemainingTreatment
 	if duration <= 0 {
@@ -174,6 +192,11 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 
 	wp.scaledSleepFn(ctx, duration)
 
+	if secondaryRes != "" {
+		wp.releaseResource(doc, secondaryRes, p.ID)
+	}
+	wp.releaseResource(doc, primaryRes, p.ID)
+
 	// Mark doctor done
 	if doc != nil {
 		doc.Busy = false
@@ -186,4 +209,101 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 	case wp.results <- d:
 	case <-ctx.Done():
 	}
+}
+
+func resourcePlanForDoctor(doctorID string) (scheduler.ResourceType, scheduler.ResourceType) {
+	// Intentionally opposing order for doc-1/doc-2 to allow circular wait.
+	switch doctorID {
+	case "doc-1":
+		return scheduler.ResLab, scheduler.ResOR
+	case "doc-2":
+		return scheduler.ResOR, scheduler.ResLab
+	default:
+		return scheduler.ResImaging, scheduler.ResLab
+	}
+}
+
+func (wp *WorkerPool) acquireWithWait(
+	ctx context.Context,
+	doc *models.Doctor,
+	p *models.Patient,
+	res scheduler.ResourceType,
+	primary bool,
+) bool {
+	if doc == nil {
+		return false
+	}
+
+	rm := wp.store.Resources
+	stage := "secondary"
+	if primary {
+		stage = "primary"
+	}
+	for {
+		if rm.TryAcquire(res, doc.ID) {
+			doc.WaitingFor = ""
+			if !containsResource(doc.HeldResources, string(res)) {
+				doc.HeldResources = append(doc.HeldResources, string(res))
+			}
+			wp.store.AddEvent(
+				"resource.acquired",
+				fmt.Sprintf("%s acquired %s (%s resource) for %s", doc.Name, res, stage, p.Name),
+				"deadlock",
+				map[string]any{
+					"doctorId":  doc.ID,
+					"patientId": p.ID,
+					"resource":  string(res),
+					"stage":     stage,
+				},
+			)
+			return true
+		}
+
+		doc.WaitingFor = string(res)
+		rm.RequestAndWait(res, doc.ID)
+		wp.store.AddEvent(
+			"resource.wait",
+			fmt.Sprintf("%s waiting for %s while treating %s", doc.Name, res, p.Name),
+			"deadlock",
+			map[string]any{
+				"doctorId":  doc.ID,
+				"patientId": p.ID,
+				"resource":  string(res),
+				"stage":     stage,
+			},
+		)
+		if !wp.scaledSleepFn(ctx, 600*time.Millisecond) {
+			return false
+		}
+	}
+}
+
+func (wp *WorkerPool) releaseResource(doc *models.Doctor, res scheduler.ResourceType, patientID string) {
+	if doc == nil || res == "" {
+		return
+	}
+	wp.store.Resources.Release(res, doc.ID)
+	removeFromSlice(&doc.HeldResources, string(res))
+	if doc.WaitingFor == string(res) {
+		doc.WaitingFor = ""
+	}
+	wp.store.AddEvent(
+		"resource.released",
+		fmt.Sprintf("%s released %s", doc.Name, res),
+		"resource-management",
+		map[string]any{
+			"doctorId":  doc.ID,
+			"patientId": patientID,
+			"resource":  string(res),
+		},
+	)
+}
+
+func containsResource(arr []string, resource string) bool {
+	for _, item := range arr {
+		if item == resource {
+			return true
+		}
+	}
+	return false
 }
