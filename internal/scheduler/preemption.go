@@ -20,7 +20,7 @@ type PreemptionResult struct {
 
 // CheckPreemption swaps Critical waiting patients into beds occupied by lower-priority ones.
 func CheckPreemption(
-	pq *PatientQueue,
+	pq Scheduler,
 	allPatients []*models.Patient,
 	beds map[string]*models.Bed,
 	doctors map[string]*models.Doctor,

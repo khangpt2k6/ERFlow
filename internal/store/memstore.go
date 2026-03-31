@@ -16,7 +16,7 @@ type MemStore struct {
 	beds     map[string]*models.Bed
 	doctors  map[string]*models.Doctor
 
-	Queue *scheduler.PatientQueue
+	Queue scheduler.Scheduler
 
 	nextPatientNum int
 
@@ -31,7 +31,7 @@ func NewMemStore() *MemStore {
 		patients: make(map[string]*models.Patient),
 		beds:     make(map[string]*models.Bed),
 		doctors:  make(map[string]*models.Doctor),
-		Queue:    scheduler.NewPatientQueue(),
+		Queue:    scheduler.NewScheduler(scheduler.AlgoPriority),
 	}
 	s.initializeER()
 	return s
@@ -337,7 +337,9 @@ func (s *MemStore) Reset() {
 	s.patients = make(map[string]*models.Patient)
 	s.beds = make(map[string]*models.Bed)
 	s.doctors = make(map[string]*models.Doctor)
-	s.Queue = scheduler.NewPatientQueue()
+	// Preserve the current algorithm across resets
+	algo := s.Queue.Name()
+	s.Queue = scheduler.NewScheduler(algo)
 	s.nextPatientNum = 0
 	s.events = nil
 	s.nextEventNum = 0

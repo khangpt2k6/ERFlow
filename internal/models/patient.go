@@ -1,8 +1,6 @@
 package models
 
-import (
-	"time"
-)
+import "time"
 
 // TriageLevel maps to real hospital triage systems (ESI - Emergency Severity Index).
 // In OS terms: this is the base priority of a process.
@@ -56,6 +54,12 @@ type Patient struct {
 	AssignedDoc     string        `json:"assignedDoctor,omitempty"`
 	Preempted       bool          `json:"preempted"`
 
+	// Scheduling fields for multiple algorithms
+	EstimatedDuration  time.Duration `json:"estimatedDuration"`  // set at creation — used by SJF
+	RemainingTreatment time.Duration `json:"remainingTreatment"` // tracks leftover work for Round Robin
+	TreatmentStarted   time.Time     `json:"-"`                  // when current treatment quantum began
+	MLFQLevel          int           `json:"mlfqLevel"`          // 0-2 for Multilevel Feedback Queue
+
 	// Index in the heap — needed by container/heap to update priority in-place.
 	// In OS terms: this is like the process's position in the ready queue.
 	HeapIndex int `json:"-"`
@@ -64,16 +68,36 @@ type Patient struct {
 // NewPatient creates a patient with initial priority set from triage level.
 // EffectivePriority starts as TriageLevel * 100, giving room for aging adjustments.
 // A Critical patient starts at 100, NonUrgent at 500.
+// EstimatedTreatmentDuration returns the expected treatment time for a triage level.
+// Used by SJF scheduler and for setting initial RemainingTreatment.
+func EstimatedTreatmentDuration(triage TriageLevel) time.Duration {
+	switch triage {
+	case Critical:
+		return 20 * time.Second
+	case Emergency:
+		return 14 * time.Second
+	case Urgent:
+		return 11 * time.Second
+	case SemiUrgent:
+		return 8 * time.Second
+	default:
+		return 6 * time.Second
+	}
+}
+
 func NewPatient(id, name string, triage TriageLevel, complaint string) *Patient {
+	est := EstimatedTreatmentDuration(triage)
 	return &Patient{
-		ID:              id,
-		Name:            name,
-		TriageLevel:     triage,
-		TriageLevelName: triage.String(),
-		EffectivePri:    int(triage) * 100,
-		Complaint:       complaint,
-		CheckInTime:     time.Now(),
-		Status:          StatusWaiting,
-		HeapIndex:       -1,
+		ID:                 id,
+		Name:               name,
+		TriageLevel:        triage,
+		TriageLevelName:    triage.String(),
+		EffectivePri:       int(triage) * 100,
+		Complaint:          complaint,
+		CheckInTime:        time.Now(),
+		Status:             StatusWaiting,
+		EstimatedDuration:  est,
+		RemainingTreatment: est,
+		HeapIndex:          -1,
 	}
 }

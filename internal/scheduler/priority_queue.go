@@ -20,6 +20,8 @@ func NewPatientQueue() *PatientQueue {
 	return pq
 }
 
+func (pq *PatientQueue) Name() Algorithm { return AlgoPriority }
+
 // Enqueue adds a patient to the priority queue.
 func (pq *PatientQueue) Enqueue(p *models.Patient) {
 	pq.mu.Lock()

@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/erflow/backend/internal/models"
@@ -56,9 +57,10 @@ type Engine struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup // tracks all goroutines for graceful shutdown
 
-	totalArrivals    int
-	totalDischarged  int
-	totalPreemptions int
+	// Atomic stats — no mutex needed for counters
+	totalArrivals    atomic.Int64
+	totalDischarged  atomic.Int64
+	totalPreemptions atomic.Int64
 
 	// Channel pipeline: generator -> scheduler -> treatment -> discharge
 	arrivals   chan arrival
@@ -116,7 +118,7 @@ func (e *Engine) Stop() {
 	e.wg.Wait()
 
 	log.Printf("%s %sENGINE STOPPED%s — Arrivals: %d, Discharged: %d, Preemptions: %d",
-		tagEngine, colorBold, colorReset, e.totalArrivals, e.totalDischarged, e.totalPreemptions)
+		tagEngine, colorBold, colorReset, e.totalArrivals.Load(), e.totalDischarged.Load(), e.totalPreemptions.Load())
 
 	e.store.AddEvent("engine.stopped", "Simulation engine paused", "priority-scheduling", nil)
 }
@@ -154,9 +156,10 @@ func (e *Engine) Stats() map[string]any {
 	return map[string]any{
 		"running":          e.running,
 		"speed":            e.speed,
-		"totalArrivals":    e.totalArrivals,
-		"totalDischarged":  e.totalDischarged,
-		"totalPreemptions": e.totalPreemptions,
+		"totalArrivals":    e.totalArrivals.Load(),
+		"totalDischarged":  e.totalDischarged.Load(),
+		"totalPreemptions": e.totalPreemptions.Load(),
+		"algorithm":        string(e.store.Queue.Name()),
 	}
 }
 

@@ -19,7 +19,7 @@ type AgingResult struct {
 // ApplyAging boosts priority of waiting patients based on wait time.
 // Every 30 minutes of waiting reduces EffectivePri by 50 (floor: 50).
 // Pass artificialAge > 0 to simulate time passing without changing CheckInTime.
-func ApplyAging(pq *PatientQueue, patients []*models.Patient, artificialAge time.Duration) []AgingResult {
+func ApplyAging(pq Scheduler, patients []*models.Patient, artificialAge time.Duration) []AgingResult {
 	var results []AgingResult
 
 	for _, p := range patients {
