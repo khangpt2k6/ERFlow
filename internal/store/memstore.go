@@ -302,6 +302,25 @@ func (s *MemStore) AssignDoctor(docID, patientID string) error {
 	return nil
 }
 
+// RemovePatientFromDoctor removes a patient from a doctor's list (write-lock protected).
+func (s *MemStore) RemovePatientFromDoctor(docID, patientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	doc, ok := s.doctors[docID]
+	if !ok {
+		return
+	}
+	for i, pid := range doc.PatientIDs {
+		if pid == patientID {
+			doc.PatientIDs = append(doc.PatientIDs[:i], doc.PatientIDs[i+1:]...)
+			break
+		}
+	}
+	if doc.CurrentPatient == patientID {
+		doc.CurrentPatient = ""
+	}
+}
+
 func (s *MemStore) GetBedsMap() map[string]*models.Bed {
 	return s.beds
 }

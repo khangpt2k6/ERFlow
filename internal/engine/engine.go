@@ -452,12 +452,7 @@ func (e *Engine) processDischarge(d discharge) {
 	}
 
 	if p.AssignedDoc != "" {
-		if doc, ok := e.store.GetDoctor(p.AssignedDoc); ok {
-			removeFromSlice(&doc.PatientIDs, p.ID)
-			if doc.CurrentPatient == p.ID {
-				doc.CurrentPatient = ""
-			}
-		}
+		e.store.RemovePatientFromDoctor(p.AssignedDoc, p.ID)
 	}
 
 	p.Status = models.StatusDischarged
