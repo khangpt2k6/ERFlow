@@ -163,6 +163,45 @@ func (e *Engine) Stats() map[string]any {
 	}
 }
 
+// SetScheduler swaps the scheduling algorithm. Drains waiting patients from the
+// old queue into the new one, preserving their state.
+func (e *Engine) SetScheduler(algo scheduler.Algorithm) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.store.Queue.Name() == algo {
+		return
+	}
+
+	// Drain old queue
+	var patients []*models.Patient
+	for {
+		p := e.store.Queue.Dequeue()
+		if p == nil {
+			break
+		}
+		patients = append(patients, p)
+	}
+
+	// Create new scheduler and re-enqueue
+	e.store.Queue = scheduler.NewScheduler(algo)
+	for _, p := range patients {
+		e.store.Queue.Enqueue(p)
+	}
+
+	log.Printf("%s Scheduler changed to %s (%d patients migrated)", tagEngine, algo, len(patients))
+	e.store.AddEvent("engine.scheduler",
+		fmt.Sprintf("Scheduling algorithm changed to %s — %d patients re-queued", algo, len(patients)),
+		"priority-scheduling",
+		map[string]any{"algorithm": string(algo), "migrated": len(patients)},
+	)
+}
+
+// GetScheduler returns the current scheduling algorithm name.
+func (e *Engine) GetScheduler() scheduler.Algorithm {
+	return e.store.Queue.Name()
+}
+
 // scaledSleep respects context cancellation and speed multiplier.
 func (e *Engine) scaledSleep(ctx context.Context, base time.Duration) bool {
 	e.mu.RLock()
@@ -375,6 +414,7 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 		}
 
 		patient.Status = models.StatusInTreatment
+		patient.TreatmentStarted = time.Now()
 
 		doc := e.store.FindAvailableDoctor()
 		docName := "no doctor available"
@@ -405,7 +445,7 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 }
 
 // --- Goroutine 3: Treatment Simulator ---
-// Checks for completed treatments and sends them through the discharges channel.
+// Checks for completed treatments and quantum expiry (Round Robin / MLFQ).
 
 func (e *Engine) treatmentSimulator(ctx context.Context) {
 	defer e.wg.Done()
@@ -417,28 +457,110 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 			return
 		}
 
+		algo := e.store.Queue.Name()
 		patients := e.store.GetAllPatients()
 		for _, p := range patients {
 			if p.Status != models.StatusInTreatment {
 				continue
 			}
-			if time.Since(p.CheckInTime) < treatmentDuration(p.TriageLevel) {
-				continue
+
+			elapsed := time.Since(p.TreatmentStarted)
+
+			// Round Robin: check quantum expiry before completion
+			if algo == scheduler.AlgoRoundRobin {
+				rr, ok := e.store.Queue.(*scheduler.RoundRobinQueue)
+				quantum := scheduler.DefaultQuantum
+				if ok {
+					quantum = rr.GetQuantum()
+				}
+				if elapsed >= quantum && p.RemainingTreatment > quantum {
+					e.interruptPatient(p, quantum)
+					continue
+				}
 			}
 
-			d := discharge{patient: p, bedID: p.AssignedBed, docID: p.AssignedDoc}
+			// MLFQ: check quantum expiry per level
+			if algo == scheduler.AlgoMLFQ {
+				levelQuantum := scheduler.GetMLFQQuantum(p.MLFQLevel)
+				if levelQuantum > 0 && elapsed >= levelQuantum && p.RemainingTreatment > levelQuantum {
+					e.interruptPatientMLFQ(p, levelQuantum)
+					continue
+				}
+			}
 
-			// Send to discharges channel — processed inline here for simplicity,
-			// but the channel makes it easy to add a separate consumer later.
-			e.processDischarge(d)
+			// Normal completion: check if treatment is done
+			if p.RemainingTreatment <= elapsed {
+				d := discharge{patient: p, bedID: p.AssignedBed, docID: p.AssignedDoc}
+				e.processDischarge(d)
 
-			select {
-			case e.discharges <- d:
-			default:
-				// non-blocking: if nobody is reading, that's fine
+				select {
+				case e.discharges <- d:
+				default:
+				}
 			}
 		}
 	}
+}
+
+// interruptPatient handles Round Robin quantum expiry — patient goes back to queue.
+func (e *Engine) interruptPatient(p *models.Patient, quantum time.Duration) {
+	bedID := p.AssignedBed
+	docID := p.AssignedDoc
+
+	p.RemainingTreatment -= quantum
+	p.Status = models.StatusWaiting
+	p.AssignedBed = ""
+	p.AssignedDoc = ""
+
+	if docID != "" {
+		e.store.RemovePatientFromDoctor(docID, p.ID)
+	}
+	if bedID != "" {
+		_, _ = e.store.ReleaseBed(bedID)
+	}
+
+	e.store.Queue.Enqueue(p)
+
+	log.Printf("%s %s↻ QUANTUM EXPIRED:%s %s — %s remaining, back to queue (Round Robin)",
+		tagTreatment, colorYellow, colorReset, p.Name, p.RemainingTreatment)
+	e.store.AddEvent("quantum.expired",
+		fmt.Sprintf("ROUND ROBIN: %s quantum expired — %s treatment remaining, rotated to back of queue", p.Name, p.RemainingTreatment),
+		"round-robin",
+		map[string]any{"patientId": p.ID, "remaining": p.RemainingTreatment.String()},
+	)
+}
+
+// interruptPatientMLFQ handles MLFQ quantum expiry — patient gets demoted to lower queue.
+func (e *Engine) interruptPatientMLFQ(p *models.Patient, quantum time.Duration) {
+	bedID := p.AssignedBed
+	docID := p.AssignedDoc
+	oldLevel := p.MLFQLevel
+
+	p.RemainingTreatment -= quantum
+	p.Status = models.StatusWaiting
+	p.AssignedBed = ""
+	p.AssignedDoc = ""
+
+	if docID != "" {
+		e.store.RemovePatientFromDoctor(docID, p.ID)
+	}
+	if bedID != "" {
+		_, _ = e.store.ReleaseBed(bedID)
+	}
+
+	// Demote: increase MLFQ level (lower priority queue)
+	if p.MLFQLevel < 2 {
+		p.MLFQLevel++
+	}
+	e.store.Queue.Enqueue(p)
+
+	log.Printf("%s %s↓ MLFQ DEMOTION:%s %s — Q%d→Q%d, %s remaining",
+		tagTreatment, colorYellow, colorReset, p.Name, oldLevel, p.MLFQLevel, p.RemainingTreatment)
+	e.store.AddEvent("mlfq.demotion",
+		fmt.Sprintf("MLFQ: %s demoted Q%d→Q%d — used full quantum, %s remaining", p.Name, oldLevel, p.MLFQLevel, p.RemainingTreatment),
+		"mlfq",
+		map[string]any{"patientId": p.ID, "oldLevel": oldLevel, "newLevel": p.MLFQLevel},
+	)
 }
 
 func (e *Engine) processDischarge(d discharge) {

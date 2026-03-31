@@ -76,6 +76,8 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			r.Post("/stop", eh.Stop)
 			r.Post("/speed", eh.Speed)
 			r.Get("/status", eh.Status)
+			r.Post("/scheduler", eh.SetScheduler)
+			r.Get("/scheduler", eh.GetScheduler)
 		})
 
 		// System state — includes engine status
