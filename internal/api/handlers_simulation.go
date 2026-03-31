@@ -680,6 +680,112 @@ func (h *SimulationHandler) Deadlock(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /api/simulate/thrashing — floods 30+ patients to overwhelm the ER.
+func (h *SimulationHandler) Thrashing(w http.ResponseWriter, r *http.Request) {
+	h.store.AddEvent("simulation.thrashing.start",
+		"THRASHING DEMO: Flooding ER with 30 patients — system will spend more time managing than treating",
+		"thrashing",
+		nil,
+	)
+
+	added := 0
+	names := []string{
+		"Alex Morgan", "Jamie Lee", "Pat Quinn", "Chris Stone", "Sam Rivers",
+		"Jordan Banks", "Casey Drew", "Riley Fox", "Avery Cole", "Quinn Hart",
+		"Taylor West", "Morgan Blake", "Dakota Ray", "Skyler James", "Drew Park",
+		"Lane Brooks", "Reese Clark", "Sage Ward", "Finley Cook", "Rowan Gray",
+		"Harper Hill", "Emery Long", "Blair Reed", "Tatum Scott", "Shea Young",
+		"Kai Prince", "Noel Grant", "Darcy Wells", "Ellis Ford", "Wren Hale",
+	}
+	complaints := []string{
+		"Persistent headache", "Minor sprain", "Low fever", "Cough and cold",
+		"Back pain", "Stomach ache", "Skin rash", "Dizziness", "Sore throat", "Fatigue",
+	}
+
+	for i, name := range names {
+		triage := models.SemiUrgent
+		if i%5 == 0 {
+			triage = models.Urgent
+		}
+		if i%10 == 0 {
+			triage = models.Emergency
+		}
+
+		id := h.store.NextPatientID()
+		p := models.NewPatient(id, name, triage, complaints[i%len(complaints)])
+		h.store.AddPatient(p)
+		h.store.Queue.Enqueue(p)
+		added++
+	}
+
+	h.store.AddEvent("simulation.thrashing.complete",
+		fmt.Sprintf("THRASHING: %d patients added — system overwhelmed, treatment times increased", added),
+		"thrashing",
+		map[string]any{"added": added},
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"scenario": "thrashing",
+		"concept":  "thrashing",
+		"added":    added,
+		"message":  fmt.Sprintf("%d patients flooded the ER — watch throughput collapse as the system thrashes", added),
+	})
+}
+
+// POST /api/simulate/context-switch — rapid patient reassignments to maximize context switch overhead.
+func (h *SimulationHandler) ContextSwitch(w http.ResponseWriter, r *http.Request) {
+	h.store.AddEvent("simulation.context-switch.start",
+		"CONTEXT SWITCH DEMO: Rapidly rotating patients between doctors to show switching overhead",
+		"context-switch",
+		nil,
+	)
+
+	// Create 6 patients with different triage levels
+	switchPatients := []struct {
+		Name      string
+		Triage    models.TriageLevel
+		Complaint string
+	}{
+		{"Alice Park", models.Urgent, "Severe migraine"},
+		{"Bob Torres", models.SemiUrgent, "Twisted ankle"},
+		{"Carol Nguyen", models.Urgent, "Allergic reaction"},
+		{"Dan Murphy", models.SemiUrgent, "Chest congestion"},
+		{"Eve Chen", models.Urgent, "Deep cut on hand"},
+		{"Frank Lee", models.SemiUrgent, "Back spasm"},
+	}
+
+	var created []*models.Patient
+	for _, sp := range switchPatients {
+		id := h.store.NextPatientID()
+		p := models.NewPatient(id, sp.Name, sp.Triage, sp.Complaint)
+		h.store.AddPatient(p)
+		h.store.Queue.Enqueue(p)
+		created = append(created, p)
+	}
+
+	// Track total switches across doctors
+	totalSwitches := 0
+	for _, doc := range h.store.GetAllDoctors() {
+		totalSwitches += doc.ContextSwitches
+	}
+
+	h.store.AddEvent("simulation.context-switch.complete",
+		fmt.Sprintf("CONTEXT SWITCH: %d patients added — doctors will experience switching overhead as they alternate", len(created)),
+		"context-switch",
+		map[string]any{"added": len(created), "currentSwitches": totalSwitches},
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"scenario":        "context-switch",
+		"concept":         "context-switch",
+		"added":           len(created),
+		"currentSwitches": totalSwitches,
+		"message":         fmt.Sprintf("%d patients added — watch doctors switch between patients with overhead delay", len(created)),
+	})
+}
+
 func (h *SimulationHandler) Reset(w http.ResponseWriter, r *http.Request) {
 	h.store.Reset()
 

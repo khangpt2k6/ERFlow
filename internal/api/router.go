@@ -28,6 +28,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 	bh := &BedHandler{store: s}
 	sh := &SimulationHandler{store: s}
 	eh := &EngineHandler{engine: eng}
+	sse := NewSSEHandler(s, eng)
 
 	r.Route("/api", func(r chi.Router) {
 		// Patient routes
@@ -59,6 +60,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 
 		// Events
 		r.Get("/events", sh.Events)
+		r.Get("/events/stream", sse.Stream) // SSE — real-time push
 
 		// Simulation scenarios
 		r.Route("/simulate", func(r chi.Router) {
@@ -69,6 +71,8 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			r.Post("/preemption", sh.Preemption)
 			r.Post("/semaphore", sh.Semaphore)
 			r.Post("/deadlock", sh.Deadlock)
+			r.Post("/thrashing", sh.Thrashing)
+			r.Post("/context-switch", sh.ContextSwitch)
 			r.Post("/reset", sh.Reset)
 		})
 
