@@ -58,19 +58,27 @@ type Engine struct {
 	wg      sync.WaitGroup // tracks all goroutines for graceful shutdown
 
 	// Atomic stats — no mutex needed for counters
-	totalArrivals    atomic.Int64
-	totalDischarged  atomic.Int64
-	totalPreemptions atomic.Int64
+	totalArrivals        atomic.Int64
+	totalDischarged      atomic.Int64
+	totalPreemptions     atomic.Int64
+	totalContextSwitches atomic.Int64
 
 	// Channel pipeline: generator -> scheduler -> treatment -> discharge
 	arrivals   chan arrival
 	discharges chan discharge
+
+	// Worker pool — doctors as bounded goroutine workers
+	pool *WorkerPool
+
+	// Thrashing monitor — detects when demand > capacity
+	thrashing *ThrashingMonitor
 }
 
 func New(s *store.MemStore) *Engine {
 	return &Engine{
-		store: s,
-		speed: 1.0,
+		store:     s,
+		speed:     1.0,
+		thrashing: NewThrashingMonitor(2.0), // thrash when patients > 2x beds
 	}
 }
 
@@ -97,11 +105,17 @@ func (e *Engine) Start() {
 		map[string]any{"speed": e.speed},
 	)
 
-	e.wg.Add(4)
+	// Create worker pool — one worker per doctor
+	numDoctors := len(e.store.GetAllDoctors())
+	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep)
+	e.pool.Start(ctx)
+
+	e.wg.Add(5)
 	go e.patientGenerator(ctx)
 	go e.schedulerLoop(ctx)
 	go e.treatmentSimulator(ctx)
 	go e.agingDaemon(ctx)
+	go e.throughputTracker(ctx)
 }
 
 func (e *Engine) Stop() {
@@ -113,6 +127,11 @@ func (e *Engine) Stop() {
 	e.running = false
 	e.cancel()
 	e.mu.Unlock()
+
+	// Stop worker pool first (closes jobs channel, waits for workers)
+	if e.pool != nil {
+		e.pool.Stop()
+	}
 
 	// Wait for all goroutines to finish — graceful shutdown
 	e.wg.Wait()
@@ -153,14 +172,20 @@ func (e *Engine) GetSpeed() float64 {
 func (e *Engine) Stats() map[string]any {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return map[string]any{
-		"running":          e.running,
-		"speed":            e.speed,
-		"totalArrivals":    e.totalArrivals.Load(),
-		"totalDischarged":  e.totalDischarged.Load(),
-		"totalPreemptions": e.totalPreemptions.Load(),
-		"algorithm":        string(e.store.Queue.Name()),
+	stats := map[string]any{
+		"running":              e.running,
+		"speed":                e.speed,
+		"totalArrivals":        e.totalArrivals.Load(),
+		"totalDischarged":      e.totalDischarged.Load(),
+		"totalPreemptions":     e.totalPreemptions.Load(),
+		"totalContextSwitches": e.totalContextSwitches.Load(),
+		"algorithm":            string(e.store.Queue.Name()),
+		"thrashing":            e.thrashing.Stats(),
 	}
+	if e.pool != nil {
+		stats["workerPool"] = e.pool.Stats()
+	}
+	return stats
 }
 
 // SetScheduler swaps the scheduling algorithm. Drains waiting patients from the
@@ -636,6 +661,51 @@ func (e *Engine) agingDaemon(ctx context.Context) {
 					fmt.Sprintf("AGING: %s priority %d → %d (waited %dm)",
 						ar.PatientName, ar.OldPriority, ar.NewPriority, ar.WaitMinutes),
 					"aging", ar,
+				)
+			}
+		}
+	}
+}
+
+// --- Goroutine 5: Throughput Tracker ---
+// Monitors patient-to-bed ratio and detects thrashing.
+
+func (e *Engine) throughputTracker(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Throughput tracker started — monitoring for thrashing", tagEngine)
+
+	for {
+		if !e.scaledSleep(ctx, 5*time.Second) {
+			return
+		}
+
+		patients := e.store.GetAllPatients()
+		active := 0
+		for _, p := range patients {
+			if p.Status != models.StatusDischarged {
+				active++
+			}
+		}
+		totalBeds := len(e.store.GetAllBeds())
+
+		stateChanged := e.thrashing.Check(active, totalBeds, e.totalDischarged.Load())
+		if stateChanged {
+			if e.thrashing.IsThrashing() {
+				log.Printf("%s %s⚠ THRASHING DETECTED — patient/bed ratio > %.1f, treatment slowing%s",
+					tagEngine, colorRed+colorBold, e.thrashing.threshold, colorReset)
+				e.store.AddEvent("thrashing.started",
+					fmt.Sprintf("THRASHING: %d active patients vs %d beds (ratio %.1f) — treatment times increased %.1fx",
+						active, totalBeds, float64(active)/float64(totalBeds), e.thrashing.overheadFactor),
+					"thrashing",
+					e.thrashing.Stats(),
+				)
+			} else {
+				log.Printf("%s %s✓ Thrashing resolved — ratio back to normal%s",
+					tagEngine, colorGreen, colorReset)
+				e.store.AddEvent("thrashing.resolved",
+					"Thrashing resolved — patient load reduced, treatment times normalized",
+					"thrashing",
+					e.thrashing.Stats(),
 				)
 			}
 		}
