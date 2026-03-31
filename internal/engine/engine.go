@@ -447,12 +447,13 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 func (e *Engine) processDischarge(d discharge) {
 	p := d.patient
 
-	if p.AssignedBed != "" {
-		_, _ = e.store.ReleaseBed(p.AssignedBed)
+	// Use d.docID (saved BEFORE discharge) — ReleaseBed wipes p.AssignedDoc
+	if d.docID != "" {
+		e.store.RemovePatientFromDoctor(d.docID, p.ID)
 	}
 
-	if p.AssignedDoc != "" {
-		e.store.RemovePatientFromDoctor(p.AssignedDoc, p.ID)
+	if d.bedID != "" {
+		_, _ = e.store.ReleaseBed(d.bedID)
 	}
 
 	p.Status = models.StatusDischarged
