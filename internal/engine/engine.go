@@ -362,86 +362,96 @@ func (e *Engine) schedulerLoop(ctx context.Context) {
 }
 
 func (e *Engine) scheduleNext(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		next := e.store.Queue.Peek()
-		if next == nil {
-			return
-		}
-
-		bed := e.store.FindAvailableBed("")
-		if bed == nil {
-			if next.TriageLevel == models.Critical {
-				log.Printf("%s %s⚠ No beds for CRITICAL %s — attempting PREEMPTION%s",
-					tagScheduler, colorRed+colorBold, next.Name, colorReset)
-
-				results := scheduler.CheckPreemption(
-					e.store.Queue,
-					e.store.GetAllPatients(),
-					e.store.GetBedsMap(),
-					e.store.GetDoctorsMap(),
-				)
-				for _, pr := range results {
-					n := e.totalPreemptions.Add(1)
-
-					log.Printf("%s %s⚡ PREEMPTION #%d: %s bumped %s from bed %s%s",
-						tagPreemption, colorRed+colorBold, n,
-						pr.IncomingPatientName, pr.PreemptedPatientName,
-						pr.BedID, colorReset)
-
-					e.store.AddEvent("preemption", scheduler.FormatPreemptionMessage(pr), "preemption", pr)
-				}
-			}
-			return
-		}
-
-		patient := e.store.Queue.Dequeue()
-		if patient == nil {
-			return
-		}
-
-		ok, _ := e.store.AssignBedSafe(bed.ID, patient.ID)
-		if !ok {
-			e.store.Queue.Enqueue(patient)
-			log.Printf("%s Bed %s taken (mutex prevented race) — %s re-queued",
-				tagScheduler, bed.ID, patient.Name)
-			continue
-		}
-
-		patient.Status = models.StatusInTreatment
-		patient.TreatmentStarted = time.Now()
-
-		doc := e.store.FindAvailableDoctor()
-		docName := "no doctor available"
-		if doc != nil {
-			_ = e.store.AssignDoctor(doc.ID, patient.ID)
-			docName = doc.Name
-		}
-
-		tc := triageColor(patient.TriageLevel)
-		log.Printf("%s %s→ ASSIGNED:%s %s → %sBed %s%s + %s [%s%s%s, pri=%d]",
-			tagScheduler, colorGreen, colorReset,
-			patient.Name, colorCyan, bed.ID, colorReset,
-			docName, tc, patient.TriageLevelName, colorReset,
-			patient.EffectivePri)
-
-		concept := "priority-scheduling"
-		if patient.TriageLevel == models.Critical {
-			concept = "preemption"
-		}
-
-		e.store.AddEvent("patient.assigned",
-			fmt.Sprintf("SCHEDULED: %s → Bed %s, %s [%s, priority %d]",
-				patient.Name, bed.ID, docName, patient.TriageLevelName, patient.EffectivePri),
-			concept,
-			map[string]any{"patientId": patient.ID, "bedId": bed.ID, "doctorId": safeDocID(doc)},
-		)
+	// Only assign ONE patient per scheduling cycle — gives the UI time to show movement
+	select {
+	case <-ctx.Done():
+		return
+	default:
 	}
+
+	next := e.store.Queue.Peek()
+	if next == nil {
+		return
+	}
+
+	// CONSTRAINT 1: Must have an available doctor (doctors are the CPU cores)
+	// Without a doctor, treatment cannot start — patient must wait.
+	doc := e.store.FindAvailableDoctor()
+	if doc == nil {
+		if next.TriageLevel == models.Critical {
+			log.Printf("%s %s⚠ No doctors for CRITICAL %s — all busy%s",
+				tagScheduler, colorRed, next.Name, colorReset)
+		} else {
+			log.Printf("%s No doctors available — %d patient(s) waiting",
+				tagScheduler, e.store.Queue.Len())
+		}
+		return
+	}
+
+	// CONSTRAINT 2: Must have an available bed
+	bed := e.store.FindAvailableBed("")
+	if bed == nil {
+		if next.TriageLevel == models.Critical {
+			log.Printf("%s %s⚠ No beds for CRITICAL %s — attempting PREEMPTION%s",
+				tagScheduler, colorRed+colorBold, next.Name, colorReset)
+
+			results := scheduler.CheckPreemption(
+				e.store.Queue,
+				e.store.GetAllPatients(),
+				e.store.GetBedsMap(),
+				e.store.GetDoctorsMap(),
+			)
+			for _, pr := range results {
+				n := e.totalPreemptions.Add(1)
+				log.Printf("%s %s⚡ PREEMPTION #%d: %s bumped %s from bed %s%s",
+					tagPreemption, colorRed+colorBold, n,
+					pr.IncomingPatientName, pr.PreemptedPatientName,
+					pr.BedID, colorReset)
+				e.store.AddEvent("preemption", scheduler.FormatPreemptionMessage(pr), "preemption", pr)
+			}
+		} else {
+			log.Printf("%s All beds full — %s (pri=%d) waits (queue: %d)",
+				tagScheduler, next.Name, next.EffectivePri, e.store.Queue.Len())
+		}
+		return
+	}
+
+	// Both bed AND doctor available — assign the patient
+	patient := e.store.Queue.Dequeue()
+	if patient == nil {
+		return
+	}
+
+	ok, _ := e.store.AssignBedSafe(bed.ID, patient.ID)
+	if !ok {
+		e.store.Queue.Enqueue(patient)
+		log.Printf("%s Bed %s taken (mutex prevented race) — %s re-queued",
+			tagScheduler, bed.ID, patient.Name)
+		return
+	}
+
+	patient.Status = models.StatusInTreatment
+	patient.TreatmentStarted = time.Now()
+	_ = e.store.AssignDoctor(doc.ID, patient.ID)
+
+	tc := triageColor(patient.TriageLevel)
+	log.Printf("%s %s→ ASSIGNED:%s %s → %sBed %s%s + %s [%s%s%s, pri=%d]",
+		tagScheduler, colorGreen, colorReset,
+		patient.Name, colorCyan, bed.ID, colorReset,
+		doc.Name, tc, patient.TriageLevelName, colorReset,
+		patient.EffectivePri)
+
+	concept := "priority-scheduling"
+	if patient.TriageLevel == models.Critical {
+		concept = "preemption"
+	}
+
+	e.store.AddEvent("patient.assigned",
+		fmt.Sprintf("SCHEDULED: %s → Bed %s, %s [%s, priority %d]",
+			patient.Name, bed.ID, doc.Name, patient.TriageLevelName, patient.EffectivePri),
+		concept,
+		map[string]any{"patientId": patient.ID, "bedId": bed.ID, "doctorId": doc.ID},
+	)
 }
 
 // --- Goroutine 3: Treatment Simulator ---
@@ -465,6 +475,13 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 			}
 
 			elapsed := time.Since(p.TreatmentStarted)
+
+			// Update RemainingTreatment so the frontend can show a live progress bar
+			newRemaining := p.EstimatedDuration - elapsed
+			if newRemaining < 0 {
+				newRemaining = 0
+			}
+			p.RemainingTreatment = newRemaining
 
 			// Round Robin: check quantum expiry before completion
 			if algo == scheduler.AlgoRoundRobin {

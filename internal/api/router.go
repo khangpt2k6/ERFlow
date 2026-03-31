@@ -68,6 +68,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			r.Post("/aging", sh.Aging)
 			r.Post("/preemption", sh.Preemption)
 			r.Post("/semaphore", sh.Semaphore)
+			// r.Post("/deadlock", sh.Deadlock) // TODO: implement deadlock simulation
 			r.Post("/reset", sh.Reset)
 		})
 
@@ -105,6 +106,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 				"events":     s.GetEvents(),
 				"engine":     eng.Stats(),
 				"semaphores": s.SemaphoreStats(),
+				"resources":  s.Resources.Stats(),
 				"counts": map[string]int{
 					"waiting":    waiting,
 					"treating":   treating,

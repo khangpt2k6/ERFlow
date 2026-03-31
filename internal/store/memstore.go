@@ -23,6 +23,9 @@ type MemStore struct {
 	ICUSem     *scheduler.BedSemaphore
 	TraumaSem  *scheduler.BedSemaphore
 
+	// Resources for deadlock detection
+	Resources *scheduler.ResourceManager
+
 	nextPatientNum int
 
 	events       []*models.Event
@@ -40,6 +43,7 @@ func NewMemStore() *MemStore {
 		GeneralSem: scheduler.NewBedSemaphore("General", 10),
 		ICUSem:     scheduler.NewBedSemaphore("ICU", 5),
 		TraumaSem:  scheduler.NewBedSemaphore("Trauma", 2),
+		Resources:  scheduler.NewResourceManager(),
 	}
 	s.initializeER()
 	return s
@@ -381,6 +385,7 @@ func (s *MemStore) Reset() {
 	s.GeneralSem = scheduler.NewBedSemaphore("General", 10)
 	s.ICUSem = scheduler.NewBedSemaphore("ICU", 5)
 	s.TraumaSem = scheduler.NewBedSemaphore("Trauma", 2)
+	s.Resources = scheduler.NewResourceManager()
 	s.nextPatientNum = 0
 	s.events = nil
 	s.nextEventNum = 0
