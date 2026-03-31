@@ -110,13 +110,14 @@ func (e *Engine) Start() {
 	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep, &e.totalContextSwitches, e.thrashing)
 	e.pool.Start(ctx)
 
-	e.wg.Add(6)
+	e.wg.Add(7)
 	go e.patientGenerator(ctx)
 	go e.schedulerLoop(ctx)
 	go e.treatmentSimulator(ctx)
 	go e.agingDaemon(ctx)
 	go e.throughputTracker(ctx)
 	go e.dischargeHandler(ctx)
+	go e.deadlockDetector(ctx)
 }
 
 func (e *Engine) Stop() {
@@ -489,12 +490,14 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 	)
 }
 
-// --- Goroutine 3: Treatment Simulator ---
-// Checks for completed treatments and quantum expiry (Round Robin / MLFQ).
+// --- Goroutine 3: Treatment Monitor ---
+// Updates RemainingTreatment for frontend progress bars and handles RR/MLFQ quantum interrupts.
+// NOTE: Actual discharge is handled by the worker pool → dischargeHandler pipeline.
+// This goroutine does NOT discharge patients — it only monitors and interrupts.
 
 func (e *Engine) treatmentSimulator(ctx context.Context) {
 	defer e.wg.Done()
-	log.Printf("%s Goroutine started — sending discharges through channel", tagTreatment)
+	log.Printf("%s Treatment monitor started — progress bars + quantum interrupts", tagTreatment)
 
 	for {
 		if !e.scaledSleep(ctx, 1500*time.Millisecond) {
@@ -540,16 +543,7 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 				}
 			}
 
-			// Normal completion: RemainingTreatment was computed above as EstimatedDuration - elapsed
-			if p.RemainingTreatment <= 0 {
-				d := discharge{patient: p, bedID: p.AssignedBed, docID: p.AssignedDoc}
-				e.processDischarge(d)
-
-				select {
-				case e.discharges <- d:
-				default:
-				}
-			}
+			// Discharge is handled by worker pool → dischargeHandler. NOT here.
 		}
 	}
 }
@@ -617,6 +611,11 @@ func (e *Engine) interruptPatientMLFQ(p *models.Patient, quantum time.Duration) 
 
 func (e *Engine) processDischarge(d discharge) {
 	p := d.patient
+
+	// Guard: prevent double-discharge
+	if p.Status == models.StatusDischarged {
+		return
+	}
 
 	// Use d.docID (saved BEFORE discharge) — ReleaseBed wipes p.AssignedDoc
 	if d.docID != "" {
@@ -738,6 +737,65 @@ func (e *Engine) throughputTracker(ctx context.Context) {
 					"thrashing",
 					e.thrashing.Stats(),
 				)
+			}
+		}
+	}
+}
+
+// --- Goroutine 6: Deadlock Detector ---
+// Continuously monitors the resource manager for circular waits between doctors.
+// OS parallel: the kernel's deadlock detection thread that periodically scans
+// the wait-for graph for cycles.
+
+func (e *Engine) deadlockDetector(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Deadlock detector started — scanning every 2s", tagEngine)
+
+	for {
+		if !e.scaledSleep(ctx, 2*time.Second) {
+			return
+		}
+
+		rm := e.store.Resources
+		graph := scheduler.NewWaitForGraph()
+		graph.BuildFromResources(rm)
+
+		detected, cycle := graph.DetectCycle()
+		if detected {
+			log.Printf("%s %s⚠ DEADLOCK DETECTED: cycle %v%s", tagEngine, colorRed+colorBold, cycle, colorReset)
+
+			e.store.AddEvent("deadlock.detected",
+				fmt.Sprintf("DEADLOCK DETECTED: Circular wait among %v", cycle),
+				"deadlock",
+				map[string]any{"cycle": cycle, "edges": graph.Edges()},
+			)
+
+			// Resolve: pick victim, force release
+			victim, action := scheduler.ResolveDeadlock(cycle, rm)
+			if victim != "" {
+				// Clean up doctor state
+				if doc, ok := e.store.GetDoctor(victim); ok {
+					doc.HeldResources = nil
+					doc.WaitingFor = ""
+
+					log.Printf("%s %s✓ DEADLOCK RESOLVED: %s — %s%s",
+						tagEngine, colorGreen, doc.Name, action, colorReset)
+
+					e.store.AddEvent("deadlock.resolved",
+						fmt.Sprintf("DEADLOCK RESOLVED: %s selected as victim — %s", doc.Name, action),
+						"deadlock",
+						map[string]any{"victim": victim, "action": action},
+					)
+				}
+
+				// Clear waiting state on other doctors in the cycle
+				for _, id := range cycle {
+					if id != victim {
+						if doc, ok := e.store.GetDoctor(id); ok {
+							doc.WaitingFor = ""
+						}
+					}
+				}
 			}
 		}
 	}

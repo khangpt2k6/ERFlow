@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"testing"
+	"time"
 
 	"github.com/erflow/backend/internal/models"
 )
@@ -110,6 +111,37 @@ func TestMLFQ_Demotion(t *testing.T) {
 	got = m.Dequeue()
 	if got.ID != "p2" {
 		t.Errorf("MLFQ should serve Q0 (p2) before Q1 (p1), got %s", got.ID)
+	}
+}
+
+func TestOptimal_Order(t *testing.T) {
+	q := NewOptimalQueue()
+
+	// Same effective priority, different remaining time: shortest remaining should go first.
+	p1 := makePatient("p1", models.Urgent)
+	p2 := makePatient("p2", models.Urgent)
+	p3 := makePatient("p3", models.Critical) // should always come first due to higher urgency
+
+	p1.RemainingTreatment = 12 * time.Second
+	p2.RemainingTreatment = 5 * time.Second
+
+	q.Enqueue(p1)
+	q.Enqueue(p2)
+	q.Enqueue(p3)
+
+	got := q.Dequeue()
+	if got.ID != "p3" {
+		t.Errorf("Optimal should keep urgency first, got %s", got.ID)
+	}
+
+	got = q.Dequeue()
+	if got.ID != "p2" {
+		t.Errorf("Optimal should pick shorter remaining treatment next, got %s", got.ID)
+	}
+
+	got = q.Dequeue()
+	if got.ID != "p1" {
+		t.Errorf("expected p1 last, got %s", got.ID)
 	}
 }
 

@@ -11,11 +11,12 @@ const (
 	AlgoSJF        Algorithm = "sjf"
 	AlgoRoundRobin Algorithm = "round-robin"
 	AlgoMLFQ       Algorithm = "mlfq"
+	AlgoOptimal    Algorithm = "optimal"
 )
 
 // AllAlgorithms returns all available scheduling algorithms.
 func AllAlgorithms() []Algorithm {
-	return []Algorithm{AlgoPriority, AlgoFCFS, AlgoSJF, AlgoRoundRobin, AlgoMLFQ}
+	return []Algorithm{AlgoPriority, AlgoFCFS, AlgoSJF, AlgoRoundRobin, AlgoMLFQ, AlgoOptimal}
 }
 
 // Scheduler is the abstraction the engine programs against.
@@ -57,6 +58,8 @@ func NewScheduler(algo Algorithm) Scheduler {
 		return NewRoundRobinQueue()
 	case AlgoMLFQ:
 		return NewMLFQ()
+	case AlgoOptimal:
+		return NewOptimalQueue()
 	default:
 		return NewPatientQueue()
 	}
