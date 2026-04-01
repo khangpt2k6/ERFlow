@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/erflow/backend/internal/metrics"
 	"github.com/erflow/backend/internal/models"
 	"github.com/erflow/backend/internal/scheduler"
 	"github.com/erflow/backend/internal/store"
@@ -118,8 +119,10 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 				return // channel closed
 			}
 			wp.activeJobs.Add(1)
+			metrics.WorkerPoolActive.Inc()
 			wp.processJob(ctx, job)
 			wp.activeJobs.Add(-1)
+			metrics.WorkerPoolActive.Dec()
 			wp.totalCompleted.Add(1)
 		}
 	}
@@ -138,6 +141,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		if doc.LastPatientID != "" && doc.LastPatientID != p.ID {
 			doc.ContextSwitches++
 			wp.totalContextSwitches.Add(1)
+			metrics.ContextSwitchesTotal.Inc()
 
 			overhead := 2 * time.Second // base context switch cost
 			log.Printf("%s %s⇄ CONTEXT SWITCH:%s %s switching from %s to %s (overhead: %v)",
