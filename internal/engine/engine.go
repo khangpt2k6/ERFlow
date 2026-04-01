@@ -535,7 +535,7 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 		return
 	}
 
-	patient.Status = models.StatusInTreatment
+	patient.Status = models.StatusInTreatment // patient goes to bed, doctor comes to them
 	patient.TreatmentStarted = time.Now()
 	_ = e.store.AssignDoctor(doc.ID, patient.ID)
 

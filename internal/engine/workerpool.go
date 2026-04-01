@@ -187,9 +187,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		}
 	}
 
-	// Reset treatment clock to when the worker ACTUALLY starts treating.
-	// Without this, the frontend progress bar hits 100% while the worker
-	// is still queued, creating "full green bar but patient stays" bug.
+	// Reset treatment clock to when the worker ACTUALLY starts.
 	p.TreatmentStarted = time.Now()
 
 	// --- Treatment Duration with Thrashing Multiplier ---

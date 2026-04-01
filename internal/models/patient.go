@@ -35,10 +35,10 @@ func (t TriageLevel) String() string {
 type PatientStatus string
 
 const (
-	StatusWaiting      PatientStatus = "waiting"
-	StatusAssigned     PatientStatus = "assigned"
-	StatusInTreatment  PatientStatus = "in-treatment"
-	StatusDischarged   PatientStatus = "discharged"
+	StatusWaiting     PatientStatus = "waiting"
+	StatusAssigned    PatientStatus = "assigned"
+	StatusInTreatment PatientStatus = "in-treatment" // in bed, doctor comes to patient
+	StatusDischarged  PatientStatus = "discharged"
 )
 
 type Patient struct {
