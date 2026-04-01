@@ -227,20 +227,25 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 	}
 
 	// After first visit: doctor may order lab/imaging (ESI 1-3)
+	docName := "Doctor"
+	docID := job.DoctorID
+	if doc != nil {
+		docName = doc.Name
+	}
+
 	if p.DoctorVisits == 1 && !p.LabOrdered && p.TriageLevel <= 3 {
 		p.LabOrdered = true
 		p.LabOrderedAt = time.Now()
 		p.Status = models.StatusAwaitingLab
 		labTypes := []string{"blood", "x-ray", "ct-scan"}
-		p.LabType = labTypes[int(p.TriageLevel)-1] // critical→blood, emergency→x-ray, urgent→ct-scan
+		p.LabType = labTypes[int(p.TriageLevel)-1]
 		log.Printf("%s %s📋 LAB ORDERED:%s %s — %s for %s",
-			tagTreatment, colorCyan, colorReset, doc.Name, p.LabType, p.Name)
+			tagTreatment, colorCyan, colorReset, docName, p.LabType, p.Name)
 		wp.store.AddEvent("lab.ordered",
-			fmt.Sprintf("LAB ORDERED: %s ordered %s for %s", doc.Name, p.LabType, p.Name),
+			fmt.Sprintf("LAB ORDERED: %s ordered %s for %s", docName, p.LabType, p.Name),
 			"resource-management",
-			map[string]any{"patientId": p.ID, "labType": p.LabType, "doctorId": doc.ID},
+			map[string]any{"patientId": p.ID, "labType": p.LabType, "doctorId": docID},
 		)
-		// Don't discharge — patient stays in bed waiting for results
 		return
 	}
 

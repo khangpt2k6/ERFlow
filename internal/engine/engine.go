@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -742,7 +743,7 @@ func (e *Engine) processDischarge(d discharge) {
 	p := d.patient
 
 	// Guard: prevent double-discharge
-	if p.Status == models.StatusDischarged {
+	if p.Status == models.StatusDischarged || p.Status == models.StatusAdmitted || p.Status == models.StatusTransferred {
 		return
 	}
 
@@ -750,14 +751,26 @@ func (e *Engine) processDischarge(d discharge) {
 	if d.docID != "" {
 		e.store.RemovePatientFromDoctor(d.docID, p.ID)
 	}
+	if p.AssignedNurse != "" {
+		e.store.RemovePatientFromNurse(p.AssignedNurse, p.ID)
+	}
 
 	if d.bedID != "" {
 		_, _ = e.store.ReleaseBed(d.bedID)
 	}
 
-	p.Status = models.StatusDischarged
+	// Apply disposition: discharge, admit, or transfer
+	switch p.Disposition {
+	case models.DispoAdmit:
+		p.Status = models.StatusAdmitted
+	case models.DispoTransfer:
+		p.Status = models.StatusTransferred
+	default:
+		p.Status = models.StatusDischarged
+	}
 	p.AssignedBed = ""
 	p.AssignedDoc = ""
+	p.AssignedNurse = ""
 
 	discharged := e.totalDischarged.Add(1)
 	metrics.DischargesTotal.WithLabelValues(p.TriageLevel.String()).Inc()
@@ -768,15 +781,20 @@ func (e *Engine) processDischarge(d discharge) {
 
 	elapsed := time.Since(p.CheckInTime).Round(time.Second)
 	tc := triageColor(p.TriageLevel)
-	log.Printf("%s %s✓ DISCHARGED:%s %s — Bed %s freed [%s%s%s] (%s, total: %d)",
-		tagTreatment, colorGreen, colorReset,
-		p.Name, d.bedID, tc, p.TriageLevelName, colorReset,
-		elapsed, discharged)
+	dispoLabel := string(p.Disposition)
+	if dispoLabel == "" {
+		dispoLabel = "discharged"
+	}
 
-	e.store.AddEvent("patient.discharged",
-		fmt.Sprintf("DISCHARGED: %s — treatment complete [was %s]", p.Name, p.TriageLevelName),
+	log.Printf("%s %s✓ %s:%s %s — Bed %s freed [%s%s%s] (%s, visits: %d/%d, total: %d)",
+		tagTreatment, colorGreen, strings.ToUpper(dispoLabel), colorReset,
+		p.Name, d.bedID, tc, p.TriageLevelName, colorReset,
+		elapsed, p.DoctorVisits, p.MaxDoctorVisits, discharged)
+
+	e.store.AddEvent("patient."+dispoLabel,
+		fmt.Sprintf("%s: %s — %d doctor visits [was %s]", strings.ToUpper(dispoLabel), p.Name, p.DoctorVisits, p.TriageLevelName),
 		"resource-management",
-		map[string]any{"patientId": p.ID},
+		map[string]any{"patientId": p.ID, "disposition": dispoLabel, "visits": p.DoctorVisits},
 	)
 }
 

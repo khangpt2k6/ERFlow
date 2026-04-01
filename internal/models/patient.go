@@ -134,7 +134,7 @@ func NewPatient(id, name string, triage TriageLevel, complaint string) *Patient 
 	dispo := DispoDischarge
 	if triage == Critical {
 		dispo = DispoAdmit // critical → admit to hospital
-	} else if triage == Emergency {
+	} else if triage == Emergency && len(id) > 0 {
 		// 50% admit, 50% discharge
 		if id[len(id)-1]%2 == 0 {
 			dispo = DispoAdmit

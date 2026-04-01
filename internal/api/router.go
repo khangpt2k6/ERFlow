@@ -102,11 +102,11 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 			var waiting, treating, discharged int
 			for _, p := range patients {
 				switch p.Status {
-				case "waiting":
+				case "waiting", "arrived", "triage":
 					waiting++
-				case "assigned", "in-treatment":
+				case "assigned", "in-treatment", "awaiting-lab":
 					treating++
-				case "discharged":
+				case "discharged", "admitted", "transferred":
 					discharged++
 				}
 			}
@@ -114,6 +114,7 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 				"patients":   patients,
 				"beds":       s.GetAllBeds(),
 				"doctors":    s.GetAllDoctors(),
+				"nurses":     s.GetAllNurses(),
 				"queue":      s.Queue.All(),
 				"queueLen":   s.Queue.Len(),
 				"events":     s.GetEvents(),
