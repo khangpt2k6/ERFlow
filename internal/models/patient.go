@@ -35,12 +35,24 @@ func (t TriageLevel) String() string {
 type PatientStatus string
 
 const (
-	StatusArrived     PatientStatus = "arrived"       // just entered ER, not triaged yet
-	StatusTriage      PatientStatus = "triage"        // being assessed at triage desk
-	StatusWaiting     PatientStatus = "waiting"       // triaged, in waiting room (ESI 4-5)
-	StatusAssigned    PatientStatus = "assigned"
-	StatusInTreatment PatientStatus = "in-treatment"  // in bed, doctor comes to patient
-	StatusDischarged  PatientStatus = "discharged"
+	StatusArrived       PatientStatus = "arrived"        // just entered ER, not triaged yet
+	StatusTriage        PatientStatus = "triage"         // being assessed at triage desk
+	StatusWaiting       PatientStatus = "waiting"        // triaged, in queue
+	StatusAssigned      PatientStatus = "assigned"       // bed assigned
+	StatusInTreatment   PatientStatus = "in-treatment"   // in bed, doctor visiting
+	StatusAwaitingLab   PatientStatus = "awaiting-lab"   // waiting for lab/imaging results
+	StatusDischarged    PatientStatus = "discharged"     // sent home
+	StatusAdmitted      PatientStatus = "admitted"       // admitted to hospital ward
+	StatusTransferred   PatientStatus = "transferred"    // transferred to another facility
+)
+
+// Disposition determines what happens after treatment.
+type Disposition string
+
+const (
+	DispoDischarge Disposition = "discharge" // go home
+	DispoAdmit     Disposition = "admit"     // admit to hospital ward
+	DispoTransfer  Disposition = "transfer"  // transfer to another facility
 )
 
 type Patient struct {
@@ -62,8 +74,23 @@ type Patient struct {
 	TreatmentStarted   time.Time     `json:"-"`                  // when current treatment quantum began
 	MLFQLevel          int           `json:"mlfqLevel"`          // 0-2 for Multilevel Feedback Queue
 
+	// Nurse assignment (OS: I/O device handling async tasks)
+	AssignedNurse string `json:"assignedNurse,omitempty"`
+
+	// Lab/imaging orders (OS: process waiting on I/O completion)
+	LabOrdered  bool      `json:"labOrdered"`            // doctor ordered lab work
+	LabType     string    `json:"labType,omitempty"`     // "blood", "ct-scan", "x-ray"
+	LabReady    bool      `json:"labReady"`              // results are back
+	LabOrderedAt time.Time `json:"-"`
+
+	// Multiple doctor visits (OS: multi-phase process execution)
+	DoctorVisits    int `json:"doctorVisits"`    // how many times doctor has visited
+	MaxDoctorVisits int `json:"maxDoctorVisits"` // total visits needed (initial exam, check results, final)
+
+	// Disposition (OS: process termination type)
+	Disposition Disposition `json:"disposition,omitempty"` // discharge, admit, or transfer
+
 	// Index in the heap — needed by container/heap to update priority in-place.
-	// In OS terms: this is like the process's position in the ready queue.
 	HeapIndex int `json:"-"`
 }
 
@@ -94,6 +121,26 @@ func NewPatient(id, name string, triage TriageLevel, complaint string) *Patient 
 	if triage <= Emergency {
 		initialStatus = StatusWaiting // already triaged by EMS
 	}
+
+	// Determine how many doctor visits needed based on severity
+	visits := 2 // default: initial exam + final check
+	if triage <= Emergency {
+		visits = 3 // critical: initial + check results + final assessment
+	} else if triage >= SemiUrgent {
+		visits = 1 // minor: single visit enough
+	}
+
+	// Determine disposition based on severity
+	dispo := DispoDischarge
+	if triage == Critical {
+		dispo = DispoAdmit // critical → admit to hospital
+	} else if triage == Emergency {
+		// 50% admit, 50% discharge
+		if id[len(id)-1]%2 == 0 {
+			dispo = DispoAdmit
+		}
+	}
+
 	return &Patient{
 		ID:                 id,
 		Name:               name,
@@ -105,6 +152,8 @@ func NewPatient(id, name string, triage TriageLevel, complaint string) *Patient 
 		Status:             initialStatus,
 		EstimatedDuration:  est,
 		RemainingTreatment: est,
+		MaxDoctorVisits:    visits,
+		Disposition:        dispo,
 		HeapIndex:          -1,
 	}
 }

@@ -16,6 +16,7 @@ type MemStore struct {
 	patients map[string]*models.Patient
 	beds     map[string]*models.Bed
 	doctors  map[string]*models.Doctor
+	nurses   map[string]*models.Nurse
 
 	Queue scheduler.Scheduler
 
@@ -44,6 +45,7 @@ func NewMemStore() *MemStore {
 		patients:   make(map[string]*models.Patient),
 		beds:       make(map[string]*models.Bed),
 		doctors:    make(map[string]*models.Doctor),
+		nurses:     make(map[string]*models.Nurse),
 		Queue:      scheduler.NewScheduler(scheduler.AlgoPriority),
 		GeneralSem: scheduler.NewBedSemaphore("General", 10),
 		ICUSem:     scheduler.NewBedSemaphore("ICU", 5),
@@ -85,6 +87,14 @@ func (s *MemStore) initializeER() {
 	s.doctors["doc-3"] = &models.Doctor{
 		ID: "doc-3", Name: "Dr. Chen", Specialty: "Trauma",
 		MaxPatients: 4, PatientIDs: []string{},
+	}
+
+	// Nurses (OS: I/O devices — handle async tasks while doctors do main work)
+	s.nurses["nurse-1"] = &models.Nurse{
+		ID: "nurse-1", Name: "Nurse Davis", MaxPatients: 6, PatientIDs: []string{},
+	}
+	s.nurses["nurse-2"] = &models.Nurse{
+		ID: "nurse-2", Name: "Nurse Evans", MaxPatients: 6, PatientIDs: []string{},
 	}
 }
 
@@ -385,6 +395,57 @@ func (s *MemStore) GetDoctorsMap() map[string]*models.Doctor {
 	return s.doctors
 }
 
+// --- Nurse methods ---
+
+func (s *MemStore) GetAllNurses() []*models.Nurse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*models.Nurse, 0, len(s.nurses))
+	for _, n := range s.nurses {
+		result = append(result, n)
+	}
+	return result
+}
+
+func (s *MemStore) FindAvailableNurse() *models.Nurse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, n := range s.nurses {
+		if len(n.PatientIDs) < n.MaxPatients {
+			return n
+		}
+	}
+	return nil
+}
+
+func (s *MemStore) AssignNurse(nurseID, patientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nurses[nurseID]
+	if !ok {
+		return
+	}
+	n.PatientIDs = append(n.PatientIDs, patientID)
+	if p, ok := s.patients[patientID]; ok {
+		p.AssignedNurse = nurseID
+	}
+}
+
+func (s *MemStore) RemovePatientFromNurse(nurseID, patientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nurses[nurseID]
+	if !ok {
+		return
+	}
+	for i, pid := range n.PatientIDs {
+		if pid == patientID {
+			n.PatientIDs = append(n.PatientIDs[:i], n.PatientIDs[i+1:]...)
+			break
+		}
+	}
+}
+
 // Reset clears all state and reinitializes the ER.
 func (s *MemStore) Reset() {
 	s.mu.Lock()
@@ -393,6 +454,7 @@ func (s *MemStore) Reset() {
 	s.patients = make(map[string]*models.Patient)
 	s.beds = make(map[string]*models.Bed)
 	s.doctors = make(map[string]*models.Doctor)
+	s.nurses = make(map[string]*models.Nurse)
 	// Preserve the current algorithm across resets
 	algo := s.Queue.Name()
 	s.Queue = scheduler.NewScheduler(algo)

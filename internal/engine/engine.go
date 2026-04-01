@@ -111,7 +111,7 @@ func (e *Engine) Start() {
 	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep, &e.totalContextSwitches, e.thrashing)
 	e.pool.Start(ctx)
 
-	e.wg.Add(7)
+	e.wg.Add(9)
 	go e.patientGenerator(ctx)
 	go e.schedulerLoop(ctx)
 	go e.treatmentSimulator(ctx)
@@ -119,6 +119,8 @@ func (e *Engine) Start() {
 	go e.throughputTracker(ctx)
 	go e.dischargeHandler(ctx)
 	go e.deadlockDetector(ctx)
+	go e.labProcessor(ctx)
+	go e.shiftManager(ctx)
 }
 
 func (e *Engine) Stop() {
@@ -942,6 +944,129 @@ func (e *Engine) deadlockDetector(ctx context.Context) {
 				}
 			}
 		}
+	}
+}
+
+// --- Goroutine: Lab/Imaging Processor ---
+// Simulates async lab work: blood tests, CT scans, X-rays.
+// OS parallel: I/O completion interrupt — process blocks on I/O, resumes when results arrive.
+func (e *Engine) labProcessor(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Lab processor started — handling async lab/imaging orders", tagEngine)
+
+	for {
+		if !e.scaledSleep(ctx, 2*time.Second) {
+			return
+		}
+
+		patients := e.store.GetAllPatients()
+		for _, p := range patients {
+			if p.Status != models.StatusAwaitingLab || p.LabReady {
+				continue
+			}
+
+			// Lab results take 4-8 seconds (scaled)
+			labDuration := 5 * time.Second
+			if p.LabType == "ct-scan" {
+				labDuration = 8 * time.Second
+			} else if p.LabType == "blood" {
+				labDuration = 4 * time.Second
+			}
+
+			if time.Since(p.LabOrderedAt) >= labDuration {
+				p.LabReady = true
+				p.Status = models.StatusInTreatment // back to treatment for doctor to review
+				p.DoctorVisits++ // doctor reviews results = another visit
+
+				log.Printf("%s %s✓ LAB RESULTS:%s %s — %s results ready (visit %d/%d)",
+					tagTreatment, colorGreen, colorReset,
+					p.Name, p.LabType, p.DoctorVisits, p.MaxDoctorVisits)
+
+				e.store.AddEvent("lab.complete",
+					fmt.Sprintf("LAB RESULTS: %s — %s results ready, doctor reviewing", p.Name, p.LabType),
+					"resource-management",
+					map[string]any{"patientId": p.ID, "labType": p.LabType},
+				)
+			}
+		}
+	}
+}
+
+// --- Goroutine: Shift Manager ---
+// Simulates doctor shift changes with patient handoff.
+// OS parallel: CPU migration in multi-core systems.
+func (e *Engine) shiftManager(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Shift manager started — doctor rotations every 60s", tagEngine)
+
+	for {
+		// Shift change every 60 seconds (scaled)
+		if !e.scaledSleep(ctx, 60*time.Second) {
+			return
+		}
+
+		doctors := e.store.GetAllDoctors()
+		if len(doctors) < 2 {
+			continue
+		}
+
+		// Pick a doctor to rotate off shift — the one with most treated patients
+		var rotatingDoc *models.Doctor
+		for _, d := range doctors {
+			if rotatingDoc == nil || d.TotalTreated > rotatingDoc.TotalTreated {
+				rotatingDoc = d
+			}
+		}
+		if rotatingDoc == nil || len(rotatingDoc.PatientIDs) == 0 {
+			continue
+		}
+
+		// Find the doctor with least load to receive handoff
+		var receivingDoc *models.Doctor
+		for _, d := range doctors {
+			if d.ID == rotatingDoc.ID {
+				continue
+			}
+			if receivingDoc == nil || len(d.PatientIDs) < len(receivingDoc.PatientIDs) {
+				receivingDoc = d
+			}
+		}
+		if receivingDoc == nil || len(receivingDoc.PatientIDs) >= receivingDoc.MaxPatients {
+			continue
+		}
+
+		// Hand off ONE patient (the most stable one — highest ESI number)
+		patients := e.store.GetAllPatients()
+		var handoffPatient *models.Patient
+		for _, p := range patients {
+			if p.AssignedDoc == rotatingDoc.ID && p.Status == models.StatusInTreatment {
+				if handoffPatient == nil || p.TriageLevel > handoffPatient.TriageLevel {
+					handoffPatient = p
+				}
+			}
+		}
+		if handoffPatient == nil {
+			continue
+		}
+
+		// Execute handoff
+		e.store.RemovePatientFromDoctor(rotatingDoc.ID, handoffPatient.ID)
+		_ = e.store.AssignDoctor(receivingDoc.ID, handoffPatient.ID)
+		handoffPatient.AssignedDoc = receivingDoc.ID
+
+		log.Printf("%s %s⇄ SHIFT HANDOFF:%s %s transferred %s → %s",
+			tagEngine, colorYellow, colorReset,
+			handoffPatient.Name, rotatingDoc.Name, receivingDoc.Name)
+
+		e.store.AddEvent("shift.handoff",
+			fmt.Sprintf("SHIFT HANDOFF: %s transferred from %s to %s", handoffPatient.Name, rotatingDoc.Name, receivingDoc.Name),
+			"context-switch",
+			map[string]any{
+				"patientId": handoffPatient.ID,
+				"fromDoctor": rotatingDoc.ID,
+				"toDoctor":   receivingDoc.ID,
+			},
+		)
 	}
 }
 

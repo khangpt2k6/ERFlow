@@ -211,13 +211,48 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		wp.releaseResource(doc, primaryRes, p.ID)
 	}
 
-	// Mark doctor done
+	// Track doctor visit
+	p.DoctorVisits++
 	if doc != nil {
 		doc.Busy = false
 		doc.TotalTreated++
 	}
 
-	// Send discharge through results channel
+	// Assign nurse if not yet assigned (nurse handles vitals, meds)
+	if p.AssignedNurse == "" {
+		if nurse := wp.store.FindAvailableNurse(); nurse != nil {
+			wp.store.AssignNurse(nurse.ID, p.ID)
+			nurse.TotalAssisted++
+		}
+	}
+
+	// After first visit: doctor may order lab/imaging (ESI 1-3)
+	if p.DoctorVisits == 1 && !p.LabOrdered && p.TriageLevel <= 3 {
+		p.LabOrdered = true
+		p.LabOrderedAt = time.Now()
+		p.Status = models.StatusAwaitingLab
+		labTypes := []string{"blood", "x-ray", "ct-scan"}
+		p.LabType = labTypes[int(p.TriageLevel)-1] // critical→blood, emergency→x-ray, urgent→ct-scan
+		log.Printf("%s %s📋 LAB ORDERED:%s %s — %s for %s",
+			tagTreatment, colorCyan, colorReset, doc.Name, p.LabType, p.Name)
+		wp.store.AddEvent("lab.ordered",
+			fmt.Sprintf("LAB ORDERED: %s ordered %s for %s", doc.Name, p.LabType, p.Name),
+			"resource-management",
+			map[string]any{"patientId": p.ID, "labType": p.LabType, "doctorId": doc.ID},
+		)
+		// Don't discharge — patient stays in bed waiting for results
+		return
+	}
+
+	// If more visits needed, don't discharge yet
+	if p.DoctorVisits < p.MaxDoctorVisits {
+		// Reset treatment for next visit (shorter follow-up)
+		p.RemainingTreatment = p.EstimatedDuration / 3
+		p.TreatmentStarted = time.Now()
+		return
+	}
+
+	// All visits complete — send to discharge/disposition
 	d := discharge{patient: p, bedID: job.BedID, docID: job.DoctorID}
 	select {
 	case wp.results <- d:
