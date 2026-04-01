@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/erflow/backend/internal/metrics"
 	"github.com/erflow/backend/internal/models"
 	"github.com/erflow/backend/internal/scheduler"
 	"github.com/erflow/backend/internal/store"
@@ -216,6 +217,7 @@ func (e *Engine) SetScheduler(algo scheduler.Algorithm) {
 		e.store.Queue.Enqueue(p)
 	}
 
+	metrics.SetActiveScheduler(string(algo))
 	log.Printf("%s Scheduler changed to %s (%d patients migrated)", tagEngine, algo, len(patients))
 	e.store.AddEvent("engine.scheduler",
 		fmt.Sprintf("Scheduling algorithm changed to %s — %d patients re-queued", algo, len(patients)),
@@ -338,6 +340,7 @@ func (e *Engine) patientGenerator(ctx context.Context) {
 		e.store.Queue.Enqueue(p)
 
 		arrivals := e.totalArrivals.Add(1)
+		metrics.PatientsTotal.WithLabelValues(triage.String()).Inc()
 
 		tc := triageColor(triage)
 		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total: %d)",
@@ -430,6 +433,7 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 			)
 			for _, pr := range results {
 				n := e.totalPreemptions.Add(1)
+				metrics.PreemptionsTotal.Inc()
 				log.Printf("%s %s⚡ PREEMPTION #%d: %s bumped %s from bed %s%s",
 					tagPreemption, colorRed+colorBold, n,
 					pr.IncomingPatientName, pr.PreemptedPatientName,
@@ -460,6 +464,10 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 	patient.Status = models.StatusInTreatment
 	patient.TreatmentStarted = time.Now()
 	_ = e.store.AssignDoctor(doc.ID, patient.ID)
+
+	// Record wait duration: time from check-in to treatment start
+	waitSec := time.Since(patient.CheckInTime).Seconds()
+	metrics.WaitDuration.WithLabelValues(patient.TriageLevel.String(), string(e.store.Queue.Name())).Observe(waitSec)
 
 	// Submit treatment job to worker pool — doctor goroutine handles it
 	if e.pool != nil {
@@ -639,6 +647,11 @@ func (e *Engine) processDischarge(d discharge) {
 	p.AssignedDoc = ""
 
 	discharged := e.totalDischarged.Add(1)
+	metrics.DischargesTotal.WithLabelValues(p.TriageLevel.String()).Inc()
+	if !p.TreatmentStarted.IsZero() {
+		treatSec := time.Since(p.TreatmentStarted).Seconds()
+		metrics.TreatmentDuration.WithLabelValues(p.TriageLevel.String()).Observe(treatSec)
+	}
 
 	elapsed := time.Since(p.CheckInTime).Round(time.Second)
 	tc := triageColor(p.TriageLevel)
@@ -690,6 +703,7 @@ func (e *Engine) agingDaemon(ctx context.Context) {
 		patients := e.store.GetAllPatients()
 		results := scheduler.ApplyAging(e.store.Queue, patients, 0)
 		if len(results) > 0 {
+			metrics.AgingBoosts.Add(float64(len(results)))
 			log.Printf("%s %s↑ AGING: %d patient(s) boosted%s",
 				tagAging, colorYellow, len(results), colorReset)
 			for _, ar := range results {
@@ -726,9 +740,17 @@ func (e *Engine) throughputTracker(ctx context.Context) {
 		}
 		totalBeds := len(e.store.GetAllBeds())
 
+		// Update Prometheus gauges
+		metrics.ActivePatients.Set(float64(active))
+		metrics.QueueLength.WithLabelValues(string(e.store.Queue.Name())).Set(float64(e.store.Queue.Len()))
+		if totalBeds > 0 {
+			metrics.PatientBedRatio.Set(float64(active) / float64(totalBeds))
+		}
+
 		stateChanged := e.thrashing.Check(active, totalBeds, e.totalDischarged.Load())
 		if stateChanged {
 			if e.thrashing.IsThrashing() {
+				metrics.ThrashingActive.Set(1)
 				log.Printf("%s %s⚠ THRASHING DETECTED — patient/bed ratio > %.1f, treatment slowing%s",
 					tagEngine, colorRed+colorBold, e.thrashing.threshold, colorReset)
 				e.store.AddEvent("thrashing.started",
@@ -738,6 +760,7 @@ func (e *Engine) throughputTracker(ctx context.Context) {
 					e.thrashing.Stats(),
 				)
 			} else {
+				metrics.ThrashingActive.Set(0)
 				log.Printf("%s %s✓ Thrashing resolved — ratio back to normal%s",
 					tagEngine, colorGreen, colorReset)
 				e.store.AddEvent("thrashing.resolved",
@@ -770,6 +793,7 @@ func (e *Engine) deadlockDetector(ctx context.Context) {
 
 		detected, cycle := graph.DetectCycle()
 		if detected {
+			metrics.DeadlocksDetected.Inc()
 			log.Printf("%s %s⚠ DEADLOCK DETECTED: cycle %v%s", tagEngine, colorRed+colorBold, cycle, colorReset)
 
 			e.store.AddEvent("deadlock.detected",
@@ -781,6 +805,7 @@ func (e *Engine) deadlockDetector(ctx context.Context) {
 			// Resolve: pick victim, force release
 			victim, action := scheduler.ResolveDeadlock(cycle, rm)
 			if victim != "" {
+				metrics.DeadlocksResolved.Inc()
 				// Clean up doctor state
 				if doc, ok := e.store.GetDoctor(victim); ok {
 					doc.HeldResources = nil
