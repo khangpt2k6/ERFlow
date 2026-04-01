@@ -58,7 +58,7 @@ func NewWorkerPool(
 	thrashing *ThrashingMonitor,
 ) *WorkerPool {
 	return &WorkerPool{
-		jobs:                 make(chan TreatmentJob, numWorkers*2),
+		jobs:                 make(chan TreatmentJob, 20), // enough for max doctor capacity (5+4+4=13)
 		results:              results,
 		workers:              numWorkers,
 		store:                st,

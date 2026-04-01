@@ -463,11 +463,19 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 
 	// Submit treatment job to worker pool — doctor goroutine handles it
 	if e.pool != nil {
-		e.pool.Submit(TreatmentJob{
+		if !e.pool.Submit(TreatmentJob{
 			Patient:  patient,
 			BedID:    bed.ID,
 			DoctorID: doc.ID,
-		})
+		}) {
+			// Pool channel full — undo assignment so resources aren't leaked
+			e.store.RemovePatientFromDoctor(doc.ID, patient.ID)
+			_, _ = e.store.ReleaseBed(bed.ID)
+			patient.Status = models.StatusWaiting
+			e.store.Queue.Enqueue(patient)
+			log.Printf("%s Worker pool full — %s re-queued", tagScheduler, patient.Name)
+			return
+		}
 	}
 
 	tc := triageColor(patient.TriageLevel)
