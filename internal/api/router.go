@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/erflow/backend/internal/engine"
 	"github.com/erflow/backend/internal/store"
@@ -29,6 +30,14 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 	sh := &SimulationHandler{store: s}
 	eh := &EngineHandler{engine: eng}
 	sse := NewSSEHandler(s, eng)
+
+	// Wire SSE broker into the store — every AddEvent pushes to connected clients
+	s.OnEvent = func(eventType string, data any) {
+		sse.Broker.Publish(eventType, data)
+	}
+
+	// Prometheus metrics endpoint — scrape at /metrics
+	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/api", func(r chi.Router) {
 		// Patient routes

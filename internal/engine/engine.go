@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/erflow/backend/internal/metrics"
 	"github.com/erflow/backend/internal/models"
 	"github.com/erflow/backend/internal/scheduler"
 	"github.com/erflow/backend/internal/store"
@@ -105,17 +106,19 @@ func (e *Engine) Start() {
 		map[string]any{"speed": e.speed},
 	)
 
-	// Create worker pool — one worker per doctor
+	// Create worker pool — one goroutine per doctor (bounded concurrency)
 	numDoctors := len(e.store.GetAllDoctors())
-	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep)
+	e.pool = NewWorkerPool(numDoctors, e.discharges, e.store, e.scaledSleep, &e.totalContextSwitches, e.thrashing)
 	e.pool.Start(ctx)
 
-	e.wg.Add(5)
+	e.wg.Add(7)
 	go e.patientGenerator(ctx)
 	go e.schedulerLoop(ctx)
 	go e.treatmentSimulator(ctx)
 	go e.agingDaemon(ctx)
 	go e.throughputTracker(ctx)
+	go e.dischargeHandler(ctx)
+	go e.deadlockDetector(ctx)
 }
 
 func (e *Engine) Stop() {
@@ -214,6 +217,7 @@ func (e *Engine) SetScheduler(algo scheduler.Algorithm) {
 		e.store.Queue.Enqueue(p)
 	}
 
+	metrics.SetActiveScheduler(string(algo))
 	log.Printf("%s Scheduler changed to %s (%d patients migrated)", tagEngine, algo, len(patients))
 	e.store.AddEvent("engine.scheduler",
 		fmt.Sprintf("Scheduling algorithm changed to %s — %d patients re-queued", algo, len(patients)),
@@ -336,6 +340,7 @@ func (e *Engine) patientGenerator(ctx context.Context) {
 		e.store.Queue.Enqueue(p)
 
 		arrivals := e.totalArrivals.Add(1)
+		metrics.PatientsTotal.WithLabelValues(triage.String()).Inc()
 
 		tc := triageColor(triage)
 		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total: %d)",
@@ -386,6 +391,70 @@ func (e *Engine) schedulerLoop(ctx context.Context) {
 	}
 }
 
+// preemptForCritical finds the lowest-priority patient currently being treated,
+// removes them from their doctor and bed, and returns the freed doctor.
+// This ensures critical/emergency patients are never left waiting while
+// non-urgent patients occupy resources.
+func (e *Engine) preemptForCritical(ctx context.Context, incoming *models.Patient) (*models.Doctor, *models.Bed) {
+	// Find the lowest-priority (highest priority number) patient in treatment
+	var victim *models.Patient
+	var victimDoc *models.Doctor
+	var victimBed *models.Bed
+
+	for _, p := range e.store.GetAllPatients() {
+		if p.Status != models.StatusInTreatment || p.AssignedDoc == "" || p.AssignedBed == "" {
+			continue
+		}
+		// Only preempt if incoming is higher priority (lower number)
+		if p.TriageLevel <= incoming.TriageLevel {
+			continue
+		}
+		if victim == nil || p.EffectivePri > victim.EffectivePri {
+			victim = p
+			if d, ok := e.store.GetDoctor(p.AssignedDoc); ok {
+				victimDoc = d
+			}
+			if b, ok := e.store.GetBed(p.AssignedBed); ok {
+				victimBed = b
+			}
+		}
+	}
+
+	if victim == nil || victimDoc == nil || victimBed == nil {
+		return nil, nil
+	}
+
+	// Preempt: remove victim from doctor and bed, put back in queue
+	e.store.RemovePatientFromDoctor(victimDoc.ID, victim.ID)
+	_, _ = e.store.ReleaseBed(victimBed.ID)
+	victim.Status = models.StatusWaiting
+	victim.AssignedBed = ""
+	victim.AssignedDoc = ""
+	victim.Preempted = true
+	e.store.Queue.Enqueue(victim)
+
+	n := e.totalPreemptions.Add(1)
+	metrics.PreemptionsTotal.Inc()
+	log.Printf("%s %s⚡ PREEMPTION #%d: CRITICAL %s bumped %s from %s + Bed %s%s",
+		tagPreemption, colorRed+colorBold, n,
+		incoming.Name, victim.Name, victimDoc.Name, victimBed.ID, colorReset)
+
+	e.store.AddEvent("preemption",
+		fmt.Sprintf("PREEMPTION: %s [%s] bumped %s [%s] — freed %s + Bed %s",
+			incoming.Name, incoming.TriageLevelName, victim.Name, victim.TriageLevelName,
+			victimDoc.Name, victimBed.ID),
+		"preemption",
+		map[string]any{
+			"incomingPatientName":  incoming.Name,
+			"preemptedPatientName": victim.Name,
+			"doctorId":             victimDoc.ID,
+			"bedId":                victimBed.ID,
+		},
+	)
+
+	return victimDoc, victimBed
+}
+
 func (e *Engine) scheduleNext(ctx context.Context) {
 	// Only assign ONE patient per scheduling cycle — gives the UI time to show movement
 	select {
@@ -401,20 +470,30 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 
 	// CONSTRAINT 1: Must have an available doctor (doctors are the CPU cores)
 	// Without a doctor, treatment cannot start — patient must wait.
+	// EXCEPTION: Critical/Emergency patients PREEMPT the lowest-priority patient.
+	var preemptedBed *models.Bed
 	doc := e.store.FindAvailableDoctor()
 	if doc == nil {
-		if next.TriageLevel == models.Critical {
-			log.Printf("%s %s⚠ No doctors for CRITICAL %s — all busy%s",
-				tagScheduler, colorRed, next.Name, colorReset)
+		if next.TriageLevel <= models.Emergency {
+			// Critical or Emergency: preempt lowest-priority patient from a doctor
+			doc, preemptedBed = e.preemptForCritical(ctx, next)
+			if doc == nil {
+				log.Printf("%s %s⚠ No doctors for CRITICAL %s — preemption failed%s",
+					tagScheduler, colorRed, next.Name, colorReset)
+				return
+			}
 		} else {
 			log.Printf("%s No doctors available — %d patient(s) waiting",
 				tagScheduler, e.store.Queue.Len())
+			return
 		}
-		return
 	}
 
-	// CONSTRAINT 2: Must have an available bed
-	bed := e.store.FindAvailableBed("")
+	// CONSTRAINT 2: Must have an available bed (preemption may have already freed one)
+	bed := preemptedBed
+	if bed == nil {
+		bed = e.store.FindAvailableBed("")
+	}
 	if bed == nil {
 		if next.TriageLevel == models.Critical {
 			log.Printf("%s %s⚠ No beds for CRITICAL %s — attempting PREEMPTION%s",
@@ -428,6 +507,7 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 			)
 			for _, pr := range results {
 				n := e.totalPreemptions.Add(1)
+				metrics.PreemptionsTotal.Inc()
 				log.Printf("%s %s⚡ PREEMPTION #%d: %s bumped %s from bed %s%s",
 					tagPreemption, colorRed+colorBold, n,
 					pr.IncomingPatientName, pr.PreemptedPatientName,
@@ -459,6 +539,27 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 	patient.TreatmentStarted = time.Now()
 	_ = e.store.AssignDoctor(doc.ID, patient.ID)
 
+	// Record wait duration: time from check-in to treatment start
+	waitSec := time.Since(patient.CheckInTime).Seconds()
+	metrics.WaitDuration.WithLabelValues(patient.TriageLevel.String(), string(e.store.Queue.Name())).Observe(waitSec)
+
+	// Submit treatment job to worker pool — doctor goroutine handles it
+	if e.pool != nil {
+		if !e.pool.Submit(TreatmentJob{
+			Patient:  patient,
+			BedID:    bed.ID,
+			DoctorID: doc.ID,
+		}) {
+			// Pool channel full — undo assignment so resources aren't leaked
+			e.store.RemovePatientFromDoctor(doc.ID, patient.ID)
+			_, _ = e.store.ReleaseBed(bed.ID)
+			patient.Status = models.StatusWaiting
+			e.store.Queue.Enqueue(patient)
+			log.Printf("%s Worker pool full — %s re-queued", tagScheduler, patient.Name)
+			return
+		}
+	}
+
 	tc := triageColor(patient.TriageLevel)
 	log.Printf("%s %s→ ASSIGNED:%s %s → %sBed %s%s + %s [%s%s%s, pri=%d]",
 		tagScheduler, colorGreen, colorReset,
@@ -479,12 +580,14 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 	)
 }
 
-// --- Goroutine 3: Treatment Simulator ---
-// Checks for completed treatments and quantum expiry (Round Robin / MLFQ).
+// --- Goroutine 3: Treatment Monitor ---
+// Updates RemainingTreatment for frontend progress bars and handles RR/MLFQ quantum interrupts.
+// NOTE: Actual discharge is handled by the worker pool → dischargeHandler pipeline.
+// This goroutine does NOT discharge patients — it only monitors and interrupts.
 
 func (e *Engine) treatmentSimulator(ctx context.Context) {
 	defer e.wg.Done()
-	log.Printf("%s Goroutine started — sending discharges through channel", tagTreatment)
+	log.Printf("%s Treatment monitor started — progress bars + quantum interrupts", tagTreatment)
 
 	for {
 		if !e.scaledSleep(ctx, 1500*time.Millisecond) {
@@ -530,16 +633,7 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 				}
 			}
 
-			// Normal completion: check if treatment is done
-			if p.RemainingTreatment <= elapsed {
-				d := discharge{patient: p, bedID: p.AssignedBed, docID: p.AssignedDoc}
-				e.processDischarge(d)
-
-				select {
-				case e.discharges <- d:
-				default:
-				}
-			}
+			// Discharge is handled by worker pool → dischargeHandler. NOT here.
 		}
 	}
 }
@@ -608,6 +702,11 @@ func (e *Engine) interruptPatientMLFQ(p *models.Patient, quantum time.Duration) 
 func (e *Engine) processDischarge(d discharge) {
 	p := d.patient
 
+	// Guard: prevent double-discharge
+	if p.Status == models.StatusDischarged {
+		return
+	}
+
 	// Use d.docID (saved BEFORE discharge) — ReleaseBed wipes p.AssignedDoc
 	if d.docID != "" {
 		e.store.RemovePatientFromDoctor(d.docID, p.ID)
@@ -622,6 +721,11 @@ func (e *Engine) processDischarge(d discharge) {
 	p.AssignedDoc = ""
 
 	discharged := e.totalDischarged.Add(1)
+	metrics.DischargesTotal.WithLabelValues(p.TriageLevel.String()).Inc()
+	if !p.TreatmentStarted.IsZero() {
+		treatSec := time.Since(p.TreatmentStarted).Seconds()
+		metrics.TreatmentDuration.WithLabelValues(p.TriageLevel.String()).Observe(treatSec)
+	}
 
 	elapsed := time.Since(p.CheckInTime).Round(time.Second)
 	tc := triageColor(p.TriageLevel)
@@ -635,6 +739,27 @@ func (e *Engine) processDischarge(d discharge) {
 		"resource-management",
 		map[string]any{"patientId": p.ID},
 	)
+}
+
+// --- Goroutine: Discharge Handler ---
+// Reads completed treatments from the worker pool's results channel
+// and processes them (free bed, remove doctor, mark discharged).
+
+func (e *Engine) dischargeHandler(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Discharge handler started — reading from worker pool results", tagTreatment)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case d, ok := <-e.discharges:
+			if !ok {
+				return
+			}
+			e.processDischarge(d)
+		}
+	}
 }
 
 // --- Goroutine 4: Aging Daemon ---
@@ -652,6 +777,7 @@ func (e *Engine) agingDaemon(ctx context.Context) {
 		patients := e.store.GetAllPatients()
 		results := scheduler.ApplyAging(e.store.Queue, patients, 0)
 		if len(results) > 0 {
+			metrics.AgingBoosts.Add(float64(len(results)))
 			log.Printf("%s %s↑ AGING: %d patient(s) boosted%s",
 				tagAging, colorYellow, len(results), colorReset)
 			for _, ar := range results {
@@ -688,9 +814,17 @@ func (e *Engine) throughputTracker(ctx context.Context) {
 		}
 		totalBeds := len(e.store.GetAllBeds())
 
+		// Update Prometheus gauges
+		metrics.ActivePatients.Set(float64(active))
+		metrics.QueueLength.WithLabelValues(string(e.store.Queue.Name())).Set(float64(e.store.Queue.Len()))
+		if totalBeds > 0 {
+			metrics.PatientBedRatio.Set(float64(active) / float64(totalBeds))
+		}
+
 		stateChanged := e.thrashing.Check(active, totalBeds, e.totalDischarged.Load())
 		if stateChanged {
 			if e.thrashing.IsThrashing() {
+				metrics.ThrashingActive.Set(1)
 				log.Printf("%s %s⚠ THRASHING DETECTED — patient/bed ratio > %.1f, treatment slowing%s",
 					tagEngine, colorRed+colorBold, e.thrashing.threshold, colorReset)
 				e.store.AddEvent("thrashing.started",
@@ -700,6 +834,7 @@ func (e *Engine) throughputTracker(ctx context.Context) {
 					e.thrashing.Stats(),
 				)
 			} else {
+				metrics.ThrashingActive.Set(0)
 				log.Printf("%s %s✓ Thrashing resolved — ratio back to normal%s",
 					tagEngine, colorGreen, colorReset)
 				e.store.AddEvent("thrashing.resolved",
@@ -707,6 +842,67 @@ func (e *Engine) throughputTracker(ctx context.Context) {
 					"thrashing",
 					e.thrashing.Stats(),
 				)
+			}
+		}
+	}
+}
+
+// --- Goroutine 6: Deadlock Detector ---
+// Continuously monitors the resource manager for circular waits between doctors.
+// OS parallel: the kernel's deadlock detection thread that periodically scans
+// the wait-for graph for cycles.
+
+func (e *Engine) deadlockDetector(ctx context.Context) {
+	defer e.wg.Done()
+	log.Printf("%s Deadlock detector started — scanning every 2s", tagEngine)
+
+	for {
+		if !e.scaledSleep(ctx, 2*time.Second) {
+			return
+		}
+
+		rm := e.store.Resources
+		graph := scheduler.NewWaitForGraph()
+		graph.BuildFromResources(rm)
+
+		detected, cycle := graph.DetectCycle()
+		if detected {
+			metrics.DeadlocksDetected.Inc()
+			log.Printf("%s %s⚠ DEADLOCK DETECTED: cycle %v%s", tagEngine, colorRed+colorBold, cycle, colorReset)
+
+			e.store.AddEvent("deadlock.detected",
+				fmt.Sprintf("DEADLOCK DETECTED: Circular wait among %v", cycle),
+				"deadlock",
+				map[string]any{"cycle": cycle, "edges": graph.Edges()},
+			)
+
+			// Resolve: pick victim, force release
+			victim, action := scheduler.ResolveDeadlock(cycle, rm)
+			if victim != "" {
+				metrics.DeadlocksResolved.Inc()
+				// Clean up doctor state
+				if doc, ok := e.store.GetDoctor(victim); ok {
+					doc.HeldResources = nil
+					doc.WaitingFor = ""
+
+					log.Printf("%s %s✓ DEADLOCK RESOLVED: %s — %s%s",
+						tagEngine, colorGreen, doc.Name, action, colorReset)
+
+					e.store.AddEvent("deadlock.resolved",
+						fmt.Sprintf("DEADLOCK RESOLVED: %s selected as victim — %s", doc.Name, action),
+						"deadlock",
+						map[string]any{"victim": victim, "action": action},
+					)
+				}
+
+				// Clear waiting state on other doctors in the cycle
+				for _, id := range cycle {
+					if id != victim {
+						if doc, ok := e.store.GetDoctor(id); ok {
+							doc.WaitingFor = ""
+						}
+					}
+				}
 			}
 		}
 	}

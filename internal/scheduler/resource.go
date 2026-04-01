@@ -59,8 +59,15 @@ func (rm *ResourceManager) TryAcquire(resType ResourceType, doctorID string) boo
 	if !ok {
 		return false
 	}
-	if res.HeldBy == "" {
+	if res.HeldBy == "" || res.HeldBy == doctorID {
 		res.HeldBy = doctorID
+		// If this doctor was waiting for the resource, clear stale wait edge.
+		for i := 0; i < len(res.WaitedBy); i++ {
+			if res.WaitedBy[i] == doctorID {
+				res.WaitedBy = append(res.WaitedBy[:i], res.WaitedBy[i+1:]...)
+				break
+			}
+		}
 		return true
 	}
 	return false
