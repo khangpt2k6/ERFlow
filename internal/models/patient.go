@@ -35,9 +35,11 @@ func (t TriageLevel) String() string {
 type PatientStatus string
 
 const (
-	StatusWaiting     PatientStatus = "waiting"
+	StatusArrived     PatientStatus = "arrived"       // just entered ER, not triaged yet
+	StatusTriage      PatientStatus = "triage"        // being assessed at triage desk
+	StatusWaiting     PatientStatus = "waiting"       // triaged, in waiting room (ESI 4-5)
 	StatusAssigned    PatientStatus = "assigned"
-	StatusInTreatment PatientStatus = "in-treatment" // in bed, doctor comes to patient
+	StatusInTreatment PatientStatus = "in-treatment"  // in bed, doctor comes to patient
 	StatusDischarged  PatientStatus = "discharged"
 )
 
@@ -87,6 +89,11 @@ func EstimatedTreatmentDuration(triage TriageLevel) time.Duration {
 
 func NewPatient(id, name string, triage TriageLevel, complaint string) *Patient {
 	est := EstimatedTreatmentDuration(triage)
+	// ESI 1-2 skip triage (arrive by ambulance, severity is obvious)
+	initialStatus := StatusArrived
+	if triage <= Emergency {
+		initialStatus = StatusWaiting // already triaged by EMS
+	}
 	return &Patient{
 		ID:                 id,
 		Name:               name,
@@ -95,7 +102,7 @@ func NewPatient(id, name string, triage TriageLevel, complaint string) *Patient 
 		EffectivePri:       int(triage) * 100,
 		Complaint:          complaint,
 		CheckInTime:        time.Now(),
-		Status:             StatusWaiting,
+		Status:             initialStatus,
 		EstimatedDuration:  est,
 		RemainingTreatment: est,
 		HeapIndex:          -1,

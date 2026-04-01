@@ -337,22 +337,37 @@ func (e *Engine) patientGenerator(ctx context.Context) {
 		id := e.store.NextPatientID()
 		p := models.NewPatient(id, name, triage, complaint)
 		e.store.AddPatient(p)
-		e.store.Queue.Enqueue(p)
 
-		arrivals := e.totalArrivals.Add(1)
+		e.totalArrivals.Add(1)
 		metrics.PatientsTotal.WithLabelValues(triage.String()).Inc()
 
 		tc := triageColor(triage)
-		log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] (queue: %d, total: %d)",
-			tagGenerator, colorGreen, name, colorReset,
-			complaint, tc, p.TriageLevelName, colorReset,
-			p.EffectivePri, e.store.Queue.Len(), arrivals)
 
-		e.store.AddEvent("patient.arrival",
-			fmt.Sprintf("NEW ARRIVAL: %s — %s [%s, priority %d]", p.Name, complaint, p.TriageLevelName, p.EffectivePri),
-			"priority-scheduling",
-			map[string]any{"patientId": p.ID, "triage": int(triage), "priority": p.EffectivePri},
-		)
+		if triage <= models.Emergency {
+			// ESI 1-2: arrive by ambulance, already triaged by EMS → straight to queue
+			e.store.Queue.Enqueue(p)
+			log.Printf("%s %s🚑 %s%s — %s [%s%s%s, pri=%d] AMBULANCE → direct to bed",
+				tagGenerator, colorRed, name, colorReset,
+				complaint, tc, p.TriageLevelName, colorReset,
+				p.EffectivePri)
+			e.store.AddEvent("patient.ambulance",
+				fmt.Sprintf("🚑 AMBULANCE: %s — %s [%s] → direct to bed", p.Name, complaint, p.TriageLevelName),
+				"priority-scheduling",
+				map[string]any{"patientId": p.ID, "triage": int(triage), "priority": p.EffectivePri, "ambulance": true},
+			)
+		} else {
+			// ESI 3-5: walk-in → triage at check-in (brief delay) → queue
+			p.Status = models.StatusTriage
+			log.Printf("%s %s+ %s%s — %s [%s%s%s, pri=%d] → triage",
+				tagGenerator, colorGreen, name, colorReset,
+				complaint, tc, p.TriageLevelName, colorReset,
+				p.EffectivePri)
+			e.store.AddEvent("patient.arrival",
+				fmt.Sprintf("WALK-IN: %s — %s → triage assessment", p.Name, complaint),
+				"priority-scheduling",
+				map[string]any{"patientId": p.ID, "triage": int(triage), "priority": p.EffectivePri},
+			)
+		}
 
 		// Send to arrivals channel — scheduler picks it up
 		select {
@@ -489,10 +504,16 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 		}
 	}
 
-	// CONSTRAINT 2: Must have an available bed (preemption may have already freed one)
+	// CONSTRAINT 2: Must have an available bed matching triage severity
+	// Real ER: Critical/Emergency → trauma/ICU, Urgent → any, Semi/Non → general
 	bed := preemptedBed
 	if bed == nil {
-		bed = e.store.FindAvailableBed("")
+		preferredBedType := bedTypeForTriage(next.TriageLevel)
+		bed = e.store.FindAvailableBed(preferredBedType)
+		if bed == nil && preferredBedType != "" {
+			// Fallback: any available bed is better than no bed
+			bed = e.store.FindAvailableBed("")
+		}
 	}
 	if bed == nil {
 		if next.TriageLevel == models.Critical {
@@ -598,6 +619,22 @@ func (e *Engine) treatmentSimulator(ctx context.Context) {
 		algo := e.store.Queue.Name()
 		patients := e.store.GetAllPatients()
 		for _, p := range patients {
+			// Triage assessment: 2-3 seconds at check-in desk, then enter queue
+			if p.Status == models.StatusTriage {
+				if time.Since(p.CheckInTime) >= 2*time.Second {
+					p.Status = models.StatusWaiting
+					e.store.Queue.Enqueue(p)
+					log.Printf("%s ✓ TRIAGED: %s → %s (pri=%d) → waiting room",
+						tagScheduler, p.Name, p.TriageLevelName, p.EffectivePri)
+					e.store.AddEvent("patient.triaged",
+						fmt.Sprintf("TRIAGED: %s assessed as %s → waiting room", p.Name, p.TriageLevelName),
+						"priority-scheduling",
+						map[string]any{"patientId": p.ID, "triage": int(p.TriageLevel)},
+					)
+				}
+				continue
+			}
+
 			if p.Status != models.StatusInTreatment {
 				continue
 			}
@@ -914,6 +951,19 @@ func removeFromSlice(s *[]string, val string) {
 			*s = append((*s)[:i], (*s)[i+1:]...)
 			return
 		}
+	}
+}
+
+// bedTypeForTriage returns the preferred bed type for a triage level.
+// Real ER: Critical/Emergency → trauma or ICU, Urgent → any, Semi/Non → general.
+func bedTypeForTriage(triage models.TriageLevel) models.BedType {
+	switch {
+	case triage <= models.Emergency:
+		return models.BedTrauma // ESI 1-2: trauma bay or ICU
+	case triage == models.Urgent:
+		return "" // ESI 3: any available bed
+	default:
+		return models.BedGeneral // ESI 4-5: general beds
 	}
 }
 
