@@ -233,7 +233,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		docName = doc.Name
 	}
 
-	if p.DoctorVisits == 1 && !p.LabOrdered && p.TriageLevel <= 3 {
+	if p.DoctorVisits == 1 && !p.LabOrdered && p.TriageLevel >= 1 && p.TriageLevel <= 3 {
 		p.LabOrdered = true
 		p.LabOrderedAt = time.Now()
 		p.Status = models.StatusAwaitingLab

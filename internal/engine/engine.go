@@ -1089,6 +1089,9 @@ func (e *Engine) shiftManager(ctx context.Context) {
 }
 
 func removeFromSlice(s *[]string, val string) {
+	if s == nil || *s == nil {
+		return
+	}
 	for i, v := range *s {
 		if v == val {
 			*s = append((*s)[:i], (*s)[i+1:]...)
