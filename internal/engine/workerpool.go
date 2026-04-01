@@ -163,7 +163,8 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 
 	// Real runtime deadlock behavior:
 	// each doctor holds one resource, then may wait for another while still holding the first.
-	primaryRes, secondaryRes := resourcePlanForDoctor(job.DoctorID)
+	algo := wp.store.Queue.Name()
+	primaryRes, secondaryRes := resourcePlanForDoctor(job.DoctorID, algo)
 	if !wp.acquireWithWait(ctx, doc, p, primaryRes, true) {
 		if doc != nil {
 			doc.Busy = false
@@ -211,8 +212,22 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 	}
 }
 
-func resourcePlanForDoctor(doctorID string) (scheduler.ResourceType, scheduler.ResourceType) {
-	// Intentionally opposing order for doc-1/doc-2 to allow circular wait.
+func resourcePlanForDoctor(doctorID string, algo scheduler.Algorithm) (scheduler.ResourceType, scheduler.ResourceType) {
+	// Optimal: ordered acquisition prevents circular wait (classic OS deadlock prevention).
+	// All doctors acquire in the same order: lab → or, so no cycle is possible.
+	if algo == scheduler.AlgoOptimal {
+		switch doctorID {
+		case "doc-1":
+			return scheduler.ResLab, scheduler.ResOR
+		case "doc-2":
+			return scheduler.ResLab, scheduler.ResOR
+		default:
+			return scheduler.ResImaging, scheduler.ResLab
+		}
+	}
+
+	// Other algorithms: intentionally opposing order for doc-1/doc-2 to allow circular wait.
+	// This lets us demonstrate deadlock detection & resolution as an OS concept.
 	switch doctorID {
 	case "doc-1":
 		return scheduler.ResLab, scheduler.ResOR
