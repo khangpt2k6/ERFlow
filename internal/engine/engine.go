@@ -391,6 +391,70 @@ func (e *Engine) schedulerLoop(ctx context.Context) {
 	}
 }
 
+// preemptForCritical finds the lowest-priority patient currently being treated,
+// removes them from their doctor and bed, and returns the freed doctor.
+// This ensures critical/emergency patients are never left waiting while
+// non-urgent patients occupy resources.
+func (e *Engine) preemptForCritical(ctx context.Context, incoming *models.Patient) (*models.Doctor, *models.Bed) {
+	// Find the lowest-priority (highest priority number) patient in treatment
+	var victim *models.Patient
+	var victimDoc *models.Doctor
+	var victimBed *models.Bed
+
+	for _, p := range e.store.GetAllPatients() {
+		if p.Status != models.StatusInTreatment || p.AssignedDoc == "" || p.AssignedBed == "" {
+			continue
+		}
+		// Only preempt if incoming is higher priority (lower number)
+		if p.TriageLevel <= incoming.TriageLevel {
+			continue
+		}
+		if victim == nil || p.EffectivePri > victim.EffectivePri {
+			victim = p
+			if d, ok := e.store.GetDoctor(p.AssignedDoc); ok {
+				victimDoc = d
+			}
+			if b, ok := e.store.GetBed(p.AssignedBed); ok {
+				victimBed = b
+			}
+		}
+	}
+
+	if victim == nil || victimDoc == nil || victimBed == nil {
+		return nil, nil
+	}
+
+	// Preempt: remove victim from doctor and bed, put back in queue
+	e.store.RemovePatientFromDoctor(victimDoc.ID, victim.ID)
+	_, _ = e.store.ReleaseBed(victimBed.ID)
+	victim.Status = models.StatusWaiting
+	victim.AssignedBed = ""
+	victim.AssignedDoc = ""
+	victim.Preempted = true
+	e.store.Queue.Enqueue(victim)
+
+	n := e.totalPreemptions.Add(1)
+	metrics.PreemptionsTotal.Inc()
+	log.Printf("%s %s⚡ PREEMPTION #%d: CRITICAL %s bumped %s from %s + Bed %s%s",
+		tagPreemption, colorRed+colorBold, n,
+		incoming.Name, victim.Name, victimDoc.Name, victimBed.ID, colorReset)
+
+	e.store.AddEvent("preemption",
+		fmt.Sprintf("PREEMPTION: %s [%s] bumped %s [%s] — freed %s + Bed %s",
+			incoming.Name, incoming.TriageLevelName, victim.Name, victim.TriageLevelName,
+			victimDoc.Name, victimBed.ID),
+		"preemption",
+		map[string]any{
+			"incomingPatientName":  incoming.Name,
+			"preemptedPatientName": victim.Name,
+			"doctorId":             victimDoc.ID,
+			"bedId":                victimBed.ID,
+		},
+	)
+
+	return victimDoc, victimBed
+}
+
 func (e *Engine) scheduleNext(ctx context.Context) {
 	// Only assign ONE patient per scheduling cycle — gives the UI time to show movement
 	select {
@@ -406,16 +470,22 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 
 	// CONSTRAINT 1: Must have an available doctor (doctors are the CPU cores)
 	// Without a doctor, treatment cannot start — patient must wait.
+	// EXCEPTION: Critical/Emergency patients PREEMPT the lowest-priority patient.
 	doc := e.store.FindAvailableDoctor()
 	if doc == nil {
-		if next.TriageLevel == models.Critical {
-			log.Printf("%s %s⚠ No doctors for CRITICAL %s — all busy%s",
-				tagScheduler, colorRed, next.Name, colorReset)
+		if next.TriageLevel <= models.Emergency {
+			// Critical or Emergency: preempt lowest-priority patient from a doctor
+			doc, _ = e.preemptForCritical(ctx, next)
+			if doc == nil {
+				log.Printf("%s %s⚠ No doctors for CRITICAL %s — preemption failed%s",
+					tagScheduler, colorRed, next.Name, colorReset)
+				return
+			}
 		} else {
 			log.Printf("%s No doctors available — %d patient(s) waiting",
 				tagScheduler, e.store.Queue.Len())
+			return
 		}
-		return
 	}
 
 	// CONSTRAINT 2: Must have an available bed

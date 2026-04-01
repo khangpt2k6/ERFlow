@@ -165,23 +165,32 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		doc.LastPatientID = p.ID
 	}
 
-	// Real runtime deadlock behavior:
-	// each doctor holds one resource, then may wait for another while still holding the first.
+	// --- Resource acquisition ---
+	// Optimal: skip shared resources entirely (deadlock prevention by elimination).
+	// Other algorithms: acquire resources to demonstrate deadlock detection.
 	algo := wp.store.Queue.Name()
 	primaryRes, secondaryRes := resourcePlanForDoctor(job.DoctorID, algo)
-	if !wp.acquireWithWait(ctx, doc, p, primaryRes, true) {
-		if doc != nil {
-			doc.Busy = false
+
+	if algo != scheduler.AlgoOptimal && primaryRes != "" {
+		if !wp.acquireWithWait(ctx, doc, p, primaryRes, true) {
+			if doc != nil {
+				doc.Busy = false
+			}
+			return
 		}
-		return
-	}
-	if secondaryRes != "" && !wp.acquireWithWait(ctx, doc, p, secondaryRes, false) {
-		wp.releaseResource(doc, primaryRes, p.ID)
-		if doc != nil {
-			doc.Busy = false
+		if secondaryRes != "" && !wp.acquireWithWait(ctx, doc, p, secondaryRes, false) {
+			wp.releaseResource(doc, primaryRes, p.ID)
+			if doc != nil {
+				doc.Busy = false
+			}
+			return
 		}
-		return
 	}
+
+	// Reset treatment clock to when the worker ACTUALLY starts treating.
+	// Without this, the frontend progress bar hits 100% while the worker
+	// is still queued, creating "full green bar but patient stays" bug.
+	p.TreatmentStarted = time.Now()
 
 	// --- Treatment Duration with Thrashing Multiplier ---
 	duration := p.RemainingTreatment
@@ -197,10 +206,12 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 
 	wp.scaledSleepFn(ctx, duration)
 
-	if secondaryRes != "" {
-		wp.releaseResource(doc, secondaryRes, p.ID)
+	if algo != scheduler.AlgoOptimal && primaryRes != "" {
+		if secondaryRes != "" {
+			wp.releaseResource(doc, secondaryRes, p.ID)
+		}
+		wp.releaseResource(doc, primaryRes, p.ID)
 	}
-	wp.releaseResource(doc, primaryRes, p.ID)
 
 	// Mark doctor done
 	if doc != nil {
@@ -258,7 +269,7 @@ func (wp *WorkerPool) acquireWithWait(
 	if primary {
 		stage = "primary"
 	}
-	for {
+	for retries := 0; retries < 12; retries++ {
 		if rm.TryAcquire(res, doc.ID) {
 			doc.WaitingFor = ""
 			if !containsResource(doc.HeldResources, string(res)) {
@@ -280,21 +291,27 @@ func (wp *WorkerPool) acquireWithWait(
 
 		doc.WaitingFor = string(res)
 		rm.RequestAndWait(res, doc.ID)
-		wp.store.AddEvent(
-			"resource.wait",
-			fmt.Sprintf("%s waiting for %s while treating %s", doc.Name, res, p.Name),
-			"deadlock",
-			map[string]any{
-				"doctorId":  doc.ID,
-				"patientId": p.ID,
-				"resource":  string(res),
-				"stage":     stage,
-			},
-		)
+		if retries == 0 {
+			wp.store.AddEvent(
+				"resource.wait",
+				fmt.Sprintf("%s waiting for %s while treating %s", doc.Name, res, p.Name),
+				"deadlock",
+				map[string]any{
+					"doctorId":  doc.ID,
+					"patientId": p.ID,
+					"resource":  string(res),
+					"stage":     stage,
+				},
+			)
+		}
 		if !wp.scaledSleepFn(ctx, 600*time.Millisecond) {
 			return false
 		}
 	}
+	// Timeout — proceed without resource to prevent permanent blocking
+	doc.WaitingFor = ""
+	rm.ForceRelease(res, doc.ID)
+	return true
 }
 
 func (wp *WorkerPool) releaseResource(doc *models.Doctor, res scheduler.ResourceType, patientID string) {
