@@ -471,11 +471,12 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 	// CONSTRAINT 1: Must have an available doctor (doctors are the CPU cores)
 	// Without a doctor, treatment cannot start — patient must wait.
 	// EXCEPTION: Critical/Emergency patients PREEMPT the lowest-priority patient.
+	var preemptedBed *models.Bed
 	doc := e.store.FindAvailableDoctor()
 	if doc == nil {
 		if next.TriageLevel <= models.Emergency {
 			// Critical or Emergency: preempt lowest-priority patient from a doctor
-			doc, _ = e.preemptForCritical(ctx, next)
+			doc, preemptedBed = e.preemptForCritical(ctx, next)
 			if doc == nil {
 				log.Printf("%s %s⚠ No doctors for CRITICAL %s — preemption failed%s",
 					tagScheduler, colorRed, next.Name, colorReset)
@@ -488,8 +489,11 @@ func (e *Engine) scheduleNext(ctx context.Context) {
 		}
 	}
 
-	// CONSTRAINT 2: Must have an available bed
-	bed := e.store.FindAvailableBed("")
+	// CONSTRAINT 2: Must have an available bed (preemption may have already freed one)
+	bed := preemptedBed
+	if bed == nil {
+		bed = e.store.FindAvailableBed("")
+	}
 	if bed == nil {
 		if next.TriageLevel == models.Critical {
 			log.Printf("%s %s⚠ No beds for CRITICAL %s — attempting PREEMPTION%s",
