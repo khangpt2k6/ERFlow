@@ -993,8 +993,9 @@ func (e *Engine) labProcessor(ctx context.Context) {
 
 			if time.Since(p.LabOrderedAt) >= labDuration {
 				p.LabReady = true
-				p.Status = models.StatusInTreatment // back to treatment for doctor to review
-				p.DoctorVisits++ // doctor reviews results = another visit
+				p.Status = models.StatusInTreatment
+				p.TreatmentStarted = time.Now()
+				p.RemainingTreatment = p.EstimatedDuration / 3 // follow-up visit is shorter
 
 				log.Printf("%s %s✓ LAB RESULTS:%s %s — %s results ready (visit %d/%d)",
 					tagTreatment, colorGreen, colorReset,
@@ -1005,6 +1006,15 @@ func (e *Engine) labProcessor(ctx context.Context) {
 					"resource-management",
 					map[string]any{"patientId": p.ID, "labType": p.LabType},
 				)
+
+				// Re-submit to worker pool for next doctor visit
+				if e.pool != nil && p.AssignedBed != "" && p.AssignedDoc != "" {
+					e.pool.Submit(TreatmentJob{
+						Patient:  p,
+						BedID:    p.AssignedBed,
+						DoctorID: p.AssignedDoc,
+					})
+				}
 			}
 		}
 	}

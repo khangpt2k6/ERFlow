@@ -249,11 +249,16 @@ func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
 		return
 	}
 
-	// If more visits needed, don't discharge yet
+	// If more visits needed, re-submit for next visit
 	if p.DoctorVisits < p.MaxDoctorVisits {
-		// Reset treatment for next visit (shorter follow-up)
 		p.RemainingTreatment = p.EstimatedDuration / 3
 		p.TreatmentStarted = time.Now()
+		// Re-submit to pool so worker picks it up again
+		wp.Submit(TreatmentJob{
+			Patient:  p,
+			BedID:    job.BedID,
+			DoctorID: job.DoctorID,
+		})
 		return
 	}
 
