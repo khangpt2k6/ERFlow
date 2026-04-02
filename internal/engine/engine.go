@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -293,8 +292,7 @@ func (e *Engine) schedulerLoop(ctx context.Context) {
 			e.handleArrival(ctx, a)
 
 		case <-ticker.C:
-			// Process any queued patients waiting for a worker slot
-			e.scheduleFromQueue(ctx)
+			// Periodic tick — currently handled inline via handleArrival
 		}
 	}
 }
@@ -304,81 +302,32 @@ func (e *Engine) handleArrival(_ context.Context, a arrival) {
 	e.totalArrivals.Add(1)
 
 	// --- Load Shedding ---
-	// When queue is over threshold, reject low-priority (ESI 4-5) patients.
-	// Critical/Emergency always admitted.
+	// When worker pool queue is over threshold, reject low-priority (ESI 4-5) patients.
+	// Critical/Emergency always admitted — priority-based admission control.
 	queueRatio := float64(e.pool.QueueDepth()) / float64(e.pool.QueueCapacity())
 	if queueRatio > e.shedThreshold && p.TriageLevel >= models.SemiUrgent {
 		e.shedding.Store(true)
 		e.totalShed.Add(1)
 		p.Status = models.StatusDischarged
-		e.store.AddEvent("load.shed",
-			fmt.Sprintf("LOAD SHED: %s [%s] rejected — system at %.0f%% capacity",
-				p.Name, p.TriageLevelName, queueRatio*100),
-			"scaling",
-			map[string]any{"patientId": p.ID, "triage": int(p.TriageLevel), "queueRatio": queueRatio},
-		)
 		return
 	}
 	if queueRatio < e.shedThreshold*0.8 {
 		e.shedding.Store(false)
 	}
 
-	// Enqueue for scheduling
-	p.Status = models.StatusWaiting
-	e.store.Queue.Enqueue(p)
-}
+	// Submit directly to worker pool — workers ARE the processing units.
+	// No bed/doctor bottleneck: the pool itself is the bounded resource.
+	p.Status = models.StatusInTreatment
+	p.TreatmentStarted = time.Now()
 
-func (e *Engine) scheduleFromQueue(ctx context.Context) {
-	// Process up to 10 patients per tick for throughput
-	for i := 0; i < 10; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		next := e.store.Queue.Peek()
-		if next == nil {
-			return
-		}
-
-		doc := e.store.FindAvailableDoctor()
-		if doc == nil {
-			return // no capacity
-		}
-
-		bed := e.store.FindAvailableBed("")
-		if bed == nil {
-			return // no beds
-		}
-
-		patient := e.store.Queue.Dequeue()
-		if patient == nil {
-			return
-		}
-
-		ok, _ := e.store.AssignBedSafe(bed.ID, patient.ID)
-		if !ok {
-			e.store.Queue.Enqueue(patient)
-			return
-		}
-
-		patient.Status = models.StatusInTreatment
-		patient.TreatmentStarted = time.Now()
-		_ = e.store.AssignDoctor(doc.ID, patient.ID)
-
-		if !e.pool.Submit(TreatmentJob{
-			Patient:  patient,
-			BedID:    bed.ID,
-			DoctorID: doc.ID,
-		}) {
-			// Pool full — undo
-			e.store.RemovePatientFromDoctor(doc.ID, patient.ID)
-			_, _ = e.store.ReleaseBed(bed.ID)
-			patient.Status = models.StatusWaiting
-			e.store.Queue.Enqueue(patient)
-			return
-		}
+	if !e.pool.Submit(TreatmentJob{
+		Patient:  p,
+		BedID:    "",
+		DoctorID: "",
+	}) {
+		// Pool queue full — backpressure
+		e.totalShed.Add(1)
+		p.Status = models.StatusDischarged
 	}
 }
 
@@ -404,21 +353,10 @@ func (e *Engine) dischargeHandler(ctx context.Context) {
 
 func (e *Engine) processDischarge(d discharge) {
 	p := d.patient
-	if p.Status == models.StatusDischarged || p.Status == models.StatusAdmitted || p.Status == models.StatusTransferred {
+	if p.Status == models.StatusDischarged {
 		return
 	}
-
-	if d.docID != "" {
-		e.store.RemovePatientFromDoctor(d.docID, p.ID)
-	}
-	if d.bedID != "" {
-		_, _ = e.store.ReleaseBed(d.bedID)
-	}
-
 	p.Status = models.StatusDischarged
-	p.AssignedBed = ""
-	p.AssignedDoc = ""
-
 	e.totalDischarged.Add(1)
 }
 
