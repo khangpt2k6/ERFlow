@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"

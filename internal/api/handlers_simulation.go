@@ -5,14 +5,10 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
-	"sync"
-	"time"
 
 	"github.com/erflow/backend/internal/models"
-	"github.com/erflow/backend/internal/scheduler"
 	"github.com/erflow/backend/internal/store"
 )
-
 
 type SimulationHandler struct {
 	store *store.MemStore
@@ -39,14 +35,13 @@ func (h *SimulationHandler) RushHour(w http.ResponseWriter, r *http.Request) {
 		{"Marcus Johnson", models.Urgent, "Allergic reaction, facial swelling"},
 	}
 
-	// Shuffle arrival order
 	rand.Shuffle(len(incoming), func(i, j int) {
 		incoming[i], incoming[j] = incoming[j], incoming[i]
 	})
 
 	h.store.AddEvent("simulation.rush-hour.start",
-		"RUSH HOUR: 10 patients arriving in rapid succession — scheduler must triage them all",
-		"priority-scheduling",
+		"RUSH HOUR: 10 patients arriving — scheduler must triage them all",
+		"scaling",
 		map[string]int{"patientCount": len(incoming)},
 	)
 
@@ -57,493 +52,67 @@ func (h *SimulationHandler) RushHour(w http.ResponseWriter, r *http.Request) {
 		h.store.AddPatient(p)
 		h.store.Queue.Enqueue(p)
 		created = append(created, p)
-
-		h.store.AddEvent("patient.checkin",
-			fmt.Sprintf("[Rush Hour] %s checked in — Triage: %s (priority %d)", p.Name, p.TriageLevelName, p.EffectivePri),
-			"priority-scheduling",
-			map[string]any{
-				"patientId":   p.ID,
-				"triageLevel": int(p.TriageLevel),
-				"priority":    p.EffectivePri,
-			},
-		)
 	}
-
-	// Queue order after insertion
-	queued := h.store.Queue.All()
-	queueOrder := make([]string, len(queued))
-	for i, p := range queued {
-		queueOrder[i] = fmt.Sprintf("%d. %s (%s, pri=%d)", i+1, p.Name, p.TriageLevelName, p.EffectivePri)
-	}
-
-	h.store.AddEvent("simulation.rush-hour.complete",
-		fmt.Sprintf("Rush hour complete: %d patients in queue, scheduler sorted by priority", len(queued)),
-		"priority-scheduling",
-		map[string]any{"queueOrder": queueOrder},
-	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":   "rush-hour",
-		"concept":    "priority-scheduling",
-		"added":      len(created),
-		"queueOrder": queueOrder,
-		"message":    "10 patients admitted — priority queue sorted them by triage severity",
+		"scenario": "rush-hour",
+		"added":    len(created),
+		"message":  "10 patients admitted — priority queue sorted them by triage severity",
 	})
 }
 
-// POST /api/simulate/cardiac-cascade — 3 Critical patients, triggers preemption if beds full.
-
-func (h *SimulationHandler) CardiacCascade(w http.ResponseWriter, r *http.Request) {
-	criticals := []struct {
-		Name      string
-		Complaint string
-	}{
-		{"Robert Chen", "Cardiac arrest — found unresponsive in waiting room"},
-		{"Maria Gonzalez", "Massive stroke — sudden onset, left side paralysis"},
-		{"Ahmed Hassan", "Anaphylactic shock — throat closing, cannot breathe"},
+// POST /api/simulate/stress — floods N patients to stress the system.
+func (h *SimulationHandler) Stress(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Count int `json:"count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Count <= 0 {
+		req.Count = 50
+	}
+	if req.Count > 1000 {
+		req.Count = 1000
 	}
 
-	h.store.AddEvent("simulation.cardiac-cascade.start",
-		"CARDIAC CASCADE: 3 Critical patients arriving — system must preempt lower-priority treatments",
-		"preemption",
-		map[string]int{"criticalCount": 3},
+	h.store.AddEvent("simulation.stress.start",
+		fmt.Sprintf("STRESS TEST: Adding %d patients", req.Count),
+		"scaling",
+		map[string]int{"count": req.Count},
 	)
 
-	var created []*models.Patient
-	for _, c := range criticals {
+	names := []string{
+		"Alex Morgan", "Jamie Lee", "Pat Quinn", "Chris Stone", "Sam Rivers",
+		"Jordan Banks", "Casey Drew", "Riley Fox", "Avery Cole", "Quinn Hart",
+		"Taylor West", "Morgan Blake", "Dakota Ray", "Skyler James", "Drew Park",
+	}
+	complaints := []string{
+		"Headache", "Sprain", "Fever", "Cough", "Back pain",
+		"Stomach ache", "Skin rash", "Dizziness", "Sore throat", "Fatigue",
+	}
+
+	for i := 0; i < req.Count; i++ {
+		triage := models.SemiUrgent
+		if i%5 == 0 {
+			triage = models.Urgent
+		}
+		if i%10 == 0 {
+			triage = models.Emergency
+		}
+		if i%50 == 0 {
+			triage = models.Critical
+		}
+
 		id := h.store.NextPatientID()
-		p := models.NewPatient(id, c.Name, models.Critical, c.Complaint)
+		p := models.NewPatient(id, names[i%len(names)], triage, complaints[i%len(complaints)])
 		h.store.AddPatient(p)
 		h.store.Queue.Enqueue(p)
-		created = append(created, p)
-
-		h.store.AddEvent("patient.checkin.critical",
-			fmt.Sprintf("[Cardiac Cascade] CRITICAL: %s — %s", p.Name, c.Complaint),
-			"preemption",
-			map[string]any{
-				"patientId": p.ID,
-				"priority":  p.EffectivePri,
-				"complaint": c.Complaint,
-			},
-		)
-	}
-
-	// Run preemption check
-	preemptionResults := scheduler.CheckPreemption(
-		h.store.Queue,
-		h.store.GetAllPatients(),
-		h.store.GetBedsMap(),
-		h.store.GetDoctorsMap(),
-	)
-
-	for _, pr := range preemptionResults {
-		h.store.AddEvent("preemption",
-			scheduler.FormatPreemptionMessage(pr),
-			"preemption",
-			pr,
-		)
-	}
-
-	if len(preemptionResults) == 0 {
-		h.store.AddEvent("simulation.cardiac-cascade.no-preemption",
-			"No preemption occurred — either beds were available or no lower-priority patients to preempt",
-			"preemption",
-			nil,
-		)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":    "cardiac-cascade",
-		"concept":     "preemption",
-		"added":       len(created),
-		"preemptions": preemptionResults,
-		"message":     fmt.Sprintf("3 Critical patients added, %d preemption(s) occurred", len(preemptionResults)),
-	})
-}
-
-// POST /api/simulate/race-condition — 2 goroutines race for the same bed without a lock.
-
-func (h *SimulationHandler) RaceCondition(w http.ResponseWriter, r *http.Request) {
-	freeBed := h.store.FindAvailableBed("")
-	if freeBed == nil {
-		http.Error(w, "no free beds available to demonstrate race condition", http.StatusConflict)
-		return
-	}
-
-	id1 := h.store.NextPatientID()
-	p1 := models.NewPatient(id1, "Liam Foster", models.Urgent, "Deep cut on hand — needs stitches")
-	h.store.AddPatient(p1)
-	h.store.Queue.Enqueue(p1)
-
-	id2 := h.store.NextPatientID()
-	p2 := models.NewPatient(id2, "Zara Okafor", models.Urgent, "Dislocated shoulder — visible deformity")
-	h.store.AddPatient(p2)
-	h.store.Queue.Enqueue(p2)
-
-	h.store.AddEvent("simulation.race-condition.start",
-		fmt.Sprintf("RACE CONDITION DEMO: %s and %s both trying to claim bed %s simultaneously WITHOUT mutex", p1.Name, p2.Name, freeBed.ID),
-		"race-condition",
-		map[string]any{
-			"bedId":    freeBed.ID,
-			"patient1": p1.ID,
-			"patient2": p2.ID,
-		},
-	)
-
-	var wg sync.WaitGroup
-	type raceResult struct {
-		patientID   string
-		patientName string
-		success     bool
-		err         error
-	}
-
-	results := make([]raceResult, 2)
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		ok, err := h.store.AssignBedUnsafe(freeBed.ID, p1.ID)
-		results[0] = raceResult{p1.ID, p1.Name, ok, err}
-	}()
-	go func() {
-		defer wg.Done()
-		ok, err := h.store.AssignBedUnsafe(freeBed.ID, p2.ID)
-		results[1] = raceResult{p2.ID, p2.Name, ok, err}
-	}()
-	wg.Wait()
-
-	bed, _ := h.store.GetBed(freeBed.ID)
-	actualOwner := bed.PatientID
-	bothClaimedSuccess := results[0].success && results[1].success
-
-	for _, res := range results {
-		if res.success {
-			h.store.Queue.Remove(func() *models.Patient {
-				p, _ := h.store.GetPatient(res.patientID)
-				return p
-			}())
-		}
-	}
-
-	var raceDetected string
-	if bothClaimedSuccess {
-		raceDetected = fmt.Sprintf("RACE DETECTED: Both %s and %s were told they got bed %s, but only %s actually has it — a classic lost-update bug.",
-			results[0].patientName, results[1].patientName, freeBed.ID, actualOwner)
-
-		// Resolve: figure out who lost, fix state with the mutex
-		loserID := results[0].patientID
-		loserName := results[0].patientName
-		if actualOwner == results[0].patientID {
-			loserID = results[1].patientID
-			loserName = results[1].patientName
-		}
-
-		h.store.ReleaseBed(freeBed.ID)
-		h.store.AssignBedSafe(freeBed.ID, actualOwner)
-		if winner, ok := h.store.GetPatient(actualOwner); ok {
-			winner.Status = models.StatusInTreatment
-		}
-
-		if loser, ok := h.store.GetPatient(loserID); ok {
-			loser.Status = models.StatusWaiting
-			loser.AssignedBed = ""
-			h.store.Queue.Enqueue(loser)
-		}
-		h.store.AddEvent("simulation.race-condition.resolved",
-			fmt.Sprintf("MUTEX FIX: Race resolved — bed %s re-assigned safely with mutex lock. %s returned to queue.", freeBed.ID, loserName),
-			"mutex",
-			map[string]any{"winnerId": actualOwner, "loserId": loserID, "bedId": freeBed.ID},
-		)
-	} else {
-		raceDetected = fmt.Sprintf("Race did not manifest this time (timing-dependent). Patient %s got the bed. In production, this bug would appear intermittently.", actualOwner)
-	}
-
-	h.store.AddEvent("simulation.race-condition.result",
-		raceDetected,
-		"race-condition",
-		map[string]any{
-			"bedId":              freeBed.ID,
-			"actualOwner":       actualOwner,
-			"bothClaimedSuccess": bothClaimedSuccess,
-			"result1":           map[string]any{"patientId": results[0].patientID, "success": results[0].success},
-			"result2":           map[string]any{"patientId": results[1].patientID, "success": results[1].success},
-		},
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":            "race-condition",
-		"concept":             "race-condition",
-		"bedId":               freeBed.ID,
-		"actualOwner":         actualOwner,
-		"bothClaimedSuccess":  bothClaimedSuccess,
-		"raceDetected":        bothClaimedSuccess,
-		"resolved":            bothClaimedSuccess,
-		"explanation":         raceDetected,
-		"patient1Result":      results[0].success,
-		"patient2Result":      results[1].success,
-	})
-}
-
-// POST /api/simulate/aging — fast-forwards wait time by 2 hours, boosting priorities.
-
-func (h *SimulationHandler) Aging(w http.ResponseWriter, r *http.Request) {
-	patients := h.store.GetAllPatients()
-	waitingCount := 0
-	for _, p := range patients {
-		if p.Status == models.StatusWaiting {
-			waitingCount++
-		}
-	}
-
-	if waitingCount == 0 {
-		http.Error(w, "no waiting patients to age — run rush-hour first", http.StatusBadRequest)
-		return
-	}
-
-	h.store.AddEvent("simulation.aging.start",
-		fmt.Sprintf("AGING SIMULATION: Fast-forwarding 2 hours for %d waiting patients — low-priority patients will get priority boosts to prevent starvation", waitingCount),
-		"aging",
-		map[string]any{"waitingCount": waitingCount, "artificialAgeMinutes": 120},
-	)
-
-	results := scheduler.ApplyAging(h.store.Queue, patients, 2*time.Hour)
-
-	for _, ar := range results {
-		h.store.AddEvent("aging.boost",
-			fmt.Sprintf("AGING: %s priority boosted from %d to %d (waited %d min) — preventing starvation", ar.PatientName, ar.OldPriority, ar.NewPriority, ar.WaitMinutes),
-			"aging",
-			ar,
-		)
-	}
-
-	h.store.AddEvent("simulation.aging.complete",
-		scheduler.FormatAgingMessage(results),
-		"aging",
-		map[string]any{"boostCount": len(results), "results": results},
-	)
-
-	// New queue order after aging
-	queued := h.store.Queue.All()
-	queueOrder := make([]string, len(queued))
-	for i, p := range queued {
-		queueOrder[i] = fmt.Sprintf("%d. %s (%s, pri=%d)", i+1, p.Name, p.TriageLevelName, p.EffectivePri)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":        "aging",
-		"concept":         "aging",
-		"patientsAffected": len(results),
-		"agingResults":    results,
-		"newQueueOrder":   queueOrder,
-		"message":         fmt.Sprintf("%d patients had their priority boosted after 2-hour simulated wait", len(results)),
-	})
-}
-
-// POST /api/simulate/preemption — fills beds, then adds a Critical patient to trigger preemption.
-
-func (h *SimulationHandler) Preemption(w http.ResponseWriter, r *http.Request) {
-	fillerPatients := []struct {
-		Name      string
-		Triage    models.TriageLevel
-		Complaint string
-	}{
-		{"Tom Bradley", models.NonUrgent, "Minor headache"},
-		{"Nina Petrov", models.SemiUrgent, "Twisted knee while jogging"},
-		{"Oscar Mendez", models.NonUrgent, "Paper cut that won't stop bleeding"},
-		{"Grace Liu", models.SemiUrgent, "Mild allergic rash on arms"},
-		{"Henry Clark", models.NonUrgent, "Requesting flu shot"},
-		{"Yuki Sato", models.SemiUrgent, "Back pain from lifting boxes"},
-		{"Bella Rossi", models.NonUrgent, "Earache for 2 days"},
-		{"Sam Washington", models.SemiUrgent, "Persistent hiccups for 6 hours"},
-		{"Ines Dubois", models.NonUrgent, "Splinter in finger"},
-		{"Ravi Patel", models.SemiUrgent, "Mild food poisoning symptoms"},
-		{"Chloe Anderson", models.NonUrgent, "Sunburn on shoulders"},
-		{"Wei Zhang", models.SemiUrgent, "Stiff neck from sleeping wrong"},
-		{"Amara Diallo", models.NonUrgent, "Bug bite, slight swelling"},
-		{"Jake Murphy", models.SemiUrgent, "Jammed finger playing basketball"},
-		{"Leila Khoury", models.NonUrgent, "Cold symptoms, wants to be checked"},
-		{"Dmitri Orlov", models.SemiUrgent, "Bruised rib from minor fall"},
-		{"Sofia Reyes", models.NonUrgent, "Wants prescription refill"},
-	}
-	fillerIdx := 0
-
-	h.store.AddEvent("simulation.preemption.start",
-		"PREEMPTION DEMO: Filling beds with low-priority patients, then admitting a Critical patient",
-		"preemption",
-		nil,
-	)
-
-	// Fill available beds
-	bedsAssigned := 0
-	for {
-		bed := h.store.FindAvailableBed("")
-		if bed == nil || fillerIdx >= len(fillerPatients) {
-			break
-		}
-
-		fp := fillerPatients[fillerIdx]
-		fillerIdx++
-
-		id := h.store.NextPatientID()
-		p := models.NewPatient(id, fp.Name, fp.Triage, fp.Complaint)
-		h.store.AddPatient(p)
-
-		ok, _ := h.store.AssignBedSafe(bed.ID, p.ID)
-		if ok {
-			p.Status = models.StatusInTreatment
-			bedsAssigned++
-
-			doc := h.store.FindAvailableDoctor()
-			if doc != nil {
-				_ = h.store.AssignDoctor(doc.ID, p.ID)
-			}
-
-			h.store.AddEvent("bed.assigned",
-				fmt.Sprintf("[Preemption Setup] %s (%s) assigned to bed %s — filling beds with low-priority patients", p.Name, p.TriageLevelName, bed.ID),
-				"preemption",
-				map[string]any{"patientId": p.ID, "bedId": bed.ID},
-			)
-		}
-	}
-
-	// Add critical patient
-	critID := h.store.NextPatientID()
-	critPatient := models.NewPatient(critID, "Kenji Nakamura", models.Critical, "Massive internal bleeding — motorcycle accident, losing consciousness")
-	h.store.AddPatient(critPatient)
-	h.store.Queue.Enqueue(critPatient)
-
-	h.store.AddEvent("patient.checkin.critical",
-		fmt.Sprintf("CRITICAL ARRIVAL: %s — %s. All %d beds occupied by lower-priority patients. Preemption needed!",
-			critPatient.Name, critPatient.Complaint, bedsAssigned),
-		"preemption",
-		map[string]any{"patientId": critPatient.ID, "bedsOccupied": bedsAssigned},
-	)
-
-	// Run preemption
-	preemptionResults := scheduler.CheckPreemption(
-		h.store.Queue,
-		h.store.GetAllPatients(),
-		h.store.GetBedsMap(),
-		h.store.GetDoctorsMap(),
-	)
-
-	for _, pr := range preemptionResults {
-		h.store.AddEvent("preemption",
-			scheduler.FormatPreemptionMessage(pr),
-			"preemption",
-			pr,
-		)
-	}
-
-	summary := fmt.Sprintf("Preemption demo complete: filled %d beds, added Critical patient %s, %d preemption(s) occurred",
-		bedsAssigned, critPatient.Name, len(preemptionResults))
-
-	h.store.AddEvent("simulation.preemption.complete", summary, "preemption",
-		map[string]any{
-			"bedsFilled":  bedsAssigned,
-			"preemptions": len(preemptionResults),
-		},
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":    "preemption",
-		"concept":     "preemption",
-		"bedsFilled":  bedsAssigned,
-		"preemptions": preemptionResults,
-		"message":     summary,
-	})
-}
-
-// POST /api/simulate/semaphore — floods 6 ICU-needing patients into 5 ICU beds.
-// The 6th patient visibly blocks on the semaphore.
-func (h *SimulationHandler) Semaphore(w http.ResponseWriter, r *http.Request) {
-	icuPatients := []struct {
-		Name      string
-		Complaint string
-	}{
-		{"Sarah Mitchell", "Severe cardiac arrhythmia — needs ICU monitoring"},
-		{"James O'Brien", "Post-surgical ICU recovery — unstable vitals"},
-		{"Priya Sharma", "Respiratory failure — requires ventilator in ICU"},
-		{"David Kim", "Septic shock — needs ICU-level IV antibiotics"},
-		{"Elena Volkov", "Traumatic brain injury — ICU observation required"},
-		{"Carlos Rivera", "Multi-organ failure — critical ICU admission"},
-	}
-
-	h.store.AddEvent("simulation.semaphore.start",
-		fmt.Sprintf("SEMAPHORE DEMO: %d patients need ICU — but only 5 ICU beds (semaphore capacity=5)", len(icuPatients)),
-		"semaphore",
-		map[string]any{"patientCount": len(icuPatients), "icuCapacity": 5},
-	)
-
-	assigned := 0
-	blocked := 0
-	for _, ip := range icuPatients {
-		id := h.store.NextPatientID()
-		p := models.NewPatient(id, ip.Name, models.Emergency, ip.Complaint)
-		h.store.AddPatient(p)
-
-		// Try to acquire ICU semaphore (non-blocking)
-		got := h.store.ICUSem.TryAcquire()
-		if !got {
-			blocked++
-			h.store.Queue.Enqueue(p)
-			h.store.AddEvent("semaphore.blocked",
-				fmt.Sprintf("SEMAPHORE BLOCKED: %s cannot enter ICU — all 5 permits held (sem=0). Waiting in queue.", p.Name),
-				"semaphore",
-				map[string]any{"patientId": p.ID, "semaphore": "ICU", "acquired": false},
-			)
-			continue
-		}
-
-		// Find an actual ICU bed
-		bed := h.store.FindAvailableBed(models.BedICU)
-		if bed == nil {
-			// Semaphore says yes but no physical bed — release permit back
-			h.store.ICUSem.Release()
-			h.store.Queue.Enqueue(p)
-			blocked++
-			continue
-		}
-
-		ok, _ := h.store.AssignBedSafe(bed.ID, p.ID)
-		if ok {
-			p.Status = models.StatusInTreatment
-			assigned++
-			doc := h.store.FindAvailableDoctor()
-			if doc != nil {
-				_ = h.store.AssignDoctor(doc.ID, p.ID)
-			}
-			h.store.AddEvent("semaphore.acquired",
-				fmt.Sprintf("SEMAPHORE ACQUIRED: %s got ICU bed %s — permit granted (sem=%d remaining)",
-					p.Name, bed.ID, 5-assigned),
-				"semaphore",
-				map[string]any{"patientId": p.ID, "bedId": bed.ID, "semaphore": "ICU", "remaining": 5 - assigned},
-			)
-		}
-	}
-
-	stats := h.store.ICUSem.Stats()
-	h.store.AddEvent("simulation.semaphore.complete",
-		fmt.Sprintf("Semaphore demo: %d assigned to ICU, %d blocked (sem available=%d, waiting=%d)",
-			assigned, blocked, stats.Available, stats.Waiting),
-		"semaphore",
-		map[string]any{"assigned": assigned, "blocked": blocked, "semaphoreStats": stats},
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":       "semaphore",
-		"concept":        "semaphore",
-		"assigned":       assigned,
-		"blocked":        blocked,
-		"semaphoreStats": stats,
-		"message":        fmt.Sprintf("%d patients got ICU beds, %d blocked — semaphore(5) enforces capacity", assigned, blocked),
+		"scenario": "stress",
+		"added":    req.Count,
+		"message":  fmt.Sprintf("%d patients added — watch the auto-scaler react", req.Count),
 	})
 }
 
@@ -556,247 +125,9 @@ func (h *SimulationHandler) Events(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /api/simulate/deadlock — creates a circular-wait deadlock between doctors.
-// Doctor Adams holds Lab, needs OR. Doctor Baker holds OR, needs Lab.
-// The wait-for graph detects the cycle and resolves it.
-func (h *SimulationHandler) Deadlock(w http.ResponseWriter, r *http.Request) {
-	rm := h.store.Resources
-
-	// Clear any existing resource state
-	for _, doc := range h.store.GetAllDoctors() {
-		rm.ReleaseAll(doc.ID)
-		doc.HeldResources = nil
-		doc.WaitingFor = ""
-	}
-
-	h.store.AddEvent("simulation.deadlock.start",
-		"DEADLOCK DEMO: Creating circular wait — Doctor Adams holds Lab (needs OR), Doctor Baker holds OR (needs Lab)",
-		"deadlock",
-		nil,
-	)
-
-	// Step 1: Doctor Adams acquires Lab
-	rm.TryAcquire(scheduler.ResLab, "doc-1")
-	doc1, _ := h.store.GetDoctor("doc-1")
-	if doc1 != nil {
-		doc1.HeldResources = []string{"lab"}
-	}
-	h.store.AddEvent("deadlock.acquire",
-		fmt.Sprintf("%s acquired Lab", doc1.Name),
-		"deadlock",
-		map[string]any{"doctorId": "doc-1", "resource": "lab", "action": "acquired"},
-	)
-
-	// Step 2: Doctor Baker acquires OR
-	rm.TryAcquire(scheduler.ResOR, "doc-2")
-	doc2, _ := h.store.GetDoctor("doc-2")
-	if doc2 != nil {
-		doc2.HeldResources = []string{"or"}
-	}
-	h.store.AddEvent("deadlock.acquire",
-		fmt.Sprintf("%s acquired OR", doc2.Name),
-		"deadlock",
-		map[string]any{"doctorId": "doc-2", "resource": "or", "action": "acquired"},
-	)
-
-	// Step 3: Doctor Adams requests OR (held by Baker) — will wait
-	rm.RequestAndWait(scheduler.ResOR, "doc-1")
-	if doc1 != nil {
-		doc1.WaitingFor = "or"
-	}
-	h.store.AddEvent("deadlock.wait",
-		fmt.Sprintf("%s requests OR — but %s holds it. Now waiting.", doc1.Name, doc2.Name),
-		"deadlock",
-		map[string]any{"doctorId": "doc-1", "resource": "or", "heldBy": "doc-2"},
-	)
-
-	// Step 4: Doctor Baker requests Lab (held by Adams) — DEADLOCK
-	rm.RequestAndWait(scheduler.ResLab, "doc-2")
-	if doc2 != nil {
-		doc2.WaitingFor = "lab"
-	}
-	h.store.AddEvent("deadlock.wait",
-		fmt.Sprintf("%s requests Lab — but %s holds it. CIRCULAR WAIT!", doc2.Name, doc1.Name),
-		"deadlock",
-		map[string]any{"doctorId": "doc-2", "resource": "lab", "heldBy": "doc-1"},
-	)
-
-	// Step 5: Detect the deadlock via wait-for graph
-	graph := scheduler.NewWaitForGraph()
-	graph.BuildFromResources(rm)
-	detected, cycle := graph.DetectCycle()
-
-	info := scheduler.DeadlockInfo{
-		Detected: detected,
-		Cycle:    cycle,
-	}
-
-	if detected {
-		h.store.AddEvent("deadlock.detected",
-			fmt.Sprintf("DEADLOCK DETECTED: Cycle found in wait-for graph: %v", cycle),
-			"deadlock",
-			map[string]any{"cycle": cycle, "edges": graph.Edges()},
-		)
-
-		// Step 6: Resolve — force victim to release
-		victim, action := scheduler.ResolveDeadlock(cycle, rm)
-		info.Resolved = true
-		info.Victim = victim
-
-		victimDoc, _ := h.store.GetDoctor(victim)
-		victimName := victim
-		if victimDoc != nil {
-			victimName = victimDoc.Name
-			victimDoc.HeldResources = nil
-			victimDoc.WaitingFor = ""
-		}
-
-		h.store.AddEvent("deadlock.resolved",
-			fmt.Sprintf("DEADLOCK RESOLVED: %s selected as victim — %s. Cycle broken.", victimName, action),
-			"deadlock",
-			map[string]any{"victim": victim, "action": action},
-		)
-
-		// Clean up the other doctor's waiting state since resource is now free
-		for _, doc := range h.store.GetAllDoctors() {
-			if doc.ID != victim {
-				doc.WaitingFor = ""
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":  "deadlock",
-		"concept":   "deadlock",
-		"deadlock":  info,
-		"resources": rm.Stats(),
-		"message": func() string {
-			if detected {
-				return fmt.Sprintf("Deadlock detected and resolved — victim: %s", info.Victim)
-			}
-			return "No deadlock detected"
-		}(),
-	})
-}
-
-// POST /api/simulate/thrashing — floods 30+ patients to overwhelm the ER.
-func (h *SimulationHandler) Thrashing(w http.ResponseWriter, r *http.Request) {
-	h.store.AddEvent("simulation.thrashing.start",
-		"THRASHING DEMO: Flooding ER with 30 patients — system will spend more time managing than treating",
-		"thrashing",
-		nil,
-	)
-
-	added := 0
-	names := []string{
-		"Alex Morgan", "Jamie Lee", "Pat Quinn", "Chris Stone", "Sam Rivers",
-		"Jordan Banks", "Casey Drew", "Riley Fox", "Avery Cole", "Quinn Hart",
-		"Taylor West", "Morgan Blake", "Dakota Ray", "Skyler James", "Drew Park",
-		"Lane Brooks", "Reese Clark", "Sage Ward", "Finley Cook", "Rowan Gray",
-		"Harper Hill", "Emery Long", "Blair Reed", "Tatum Scott", "Shea Young",
-		"Kai Prince", "Noel Grant", "Darcy Wells", "Ellis Ford", "Wren Hale",
-	}
-	complaints := []string{
-		"Persistent headache", "Minor sprain", "Low fever", "Cough and cold",
-		"Back pain", "Stomach ache", "Skin rash", "Dizziness", "Sore throat", "Fatigue",
-	}
-
-	for i, name := range names {
-		triage := models.SemiUrgent
-		if i%5 == 0 {
-			triage = models.Urgent
-		}
-		if i%10 == 0 {
-			triage = models.Emergency
-		}
-
-		id := h.store.NextPatientID()
-		p := models.NewPatient(id, name, triage, complaints[i%len(complaints)])
-		h.store.AddPatient(p)
-		h.store.Queue.Enqueue(p)
-		added++
-	}
-
-	h.store.AddEvent("simulation.thrashing.complete",
-		fmt.Sprintf("THRASHING: %d patients added — system overwhelmed, treatment times increased", added),
-		"thrashing",
-		map[string]any{"added": added},
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario": "thrashing",
-		"concept":  "thrashing",
-		"added":    added,
-		"message":  fmt.Sprintf("%d patients flooded the ER — watch throughput collapse as the system thrashes", added),
-	})
-}
-
-// POST /api/simulate/context-switch — rapid patient reassignments to maximize context switch overhead.
-func (h *SimulationHandler) ContextSwitch(w http.ResponseWriter, r *http.Request) {
-	h.store.AddEvent("simulation.context-switch.start",
-		"CONTEXT SWITCH DEMO: Rapidly rotating patients between doctors to show switching overhead",
-		"context-switch",
-		nil,
-	)
-
-	// Create 6 patients with different triage levels
-	switchPatients := []struct {
-		Name      string
-		Triage    models.TriageLevel
-		Complaint string
-	}{
-		{"Alice Park", models.Urgent, "Severe migraine"},
-		{"Bob Torres", models.SemiUrgent, "Twisted ankle"},
-		{"Carol Nguyen", models.Urgent, "Allergic reaction"},
-		{"Dan Murphy", models.SemiUrgent, "Chest congestion"},
-		{"Eve Chen", models.Urgent, "Deep cut on hand"},
-		{"Frank Lee", models.SemiUrgent, "Back spasm"},
-	}
-
-	var created []*models.Patient
-	for _, sp := range switchPatients {
-		id := h.store.NextPatientID()
-		p := models.NewPatient(id, sp.Name, sp.Triage, sp.Complaint)
-		h.store.AddPatient(p)
-		h.store.Queue.Enqueue(p)
-		created = append(created, p)
-	}
-
-	// Track total switches across doctors
-	totalSwitches := 0
-	for _, doc := range h.store.GetAllDoctors() {
-		totalSwitches += doc.ContextSwitches
-	}
-
-	h.store.AddEvent("simulation.context-switch.complete",
-		fmt.Sprintf("CONTEXT SWITCH: %d patients added — doctors will experience switching overhead as they alternate", len(created)),
-		"context-switch",
-		map[string]any{"added": len(created), "currentSwitches": totalSwitches},
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"scenario":        "context-switch",
-		"concept":         "context-switch",
-		"added":           len(created),
-		"currentSwitches": totalSwitches,
-		"message":         fmt.Sprintf("%d patients added — watch doctors switch between patients with overhead delay", len(created)),
-	})
-}
-
 func (h *SimulationHandler) Reset(w http.ResponseWriter, r *http.Request) {
 	h.store.Reset()
-
-	h.store.AddEvent("system.reset",
-		"System reset — all patients discharged, all beds freed, all queues cleared. Fresh start.",
-		"resource-management",
-		nil,
-	)
-
+	h.store.AddEvent("system.reset", "System reset — fresh start", "scaling", nil)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "ER system reset to initial state",
-	})
+	json.NewEncoder(w).Encode(map[string]string{"message": "ER system reset"})
 }

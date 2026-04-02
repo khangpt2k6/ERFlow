@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/erflow/backend/internal/engine"
-	"github.com/erflow/backend/internal/scheduler"
 )
 
 type EngineHandler struct {
@@ -42,39 +41,22 @@ func (h *EngineHandler) Status(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(h.engine.Stats())
 }
 
-// SetScheduler handles POST /api/engine/scheduler — switches the scheduling algorithm.
-func (h *EngineHandler) SetScheduler(w http.ResponseWriter, r *http.Request) {
+// SetRPS handles POST /api/engine/rps — sets the load generator rate.
+func (h *EngineHandler) SetRPS(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Algorithm string `json:"algorithm"`
+		RPS int64 `json:"rps"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-
-	algo := scheduler.Algorithm(req.Algorithm)
-	valid := false
-	for _, a := range scheduler.AllAlgorithms() {
-		if a == algo {
-			valid = true
-			break
-		}
+	if req.RPS < 0 {
+		req.RPS = 0
 	}
-	if !valid {
-		http.Error(w, "invalid algorithm: "+req.Algorithm, http.StatusBadRequest)
-		return
+	if req.RPS > 50000 {
+		req.RPS = 50000
 	}
-
-	h.engine.SetScheduler(algo)
+	h.engine.SetRPS(req.RPS)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(h.engine.Stats())
-}
-
-// GetScheduler handles GET /api/engine/scheduler — returns current algorithm and available options.
-func (h *EngineHandler) GetScheduler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"algorithm": string(h.engine.GetScheduler()),
-		"available": scheduler.AllAlgorithms(),
-	})
 }
