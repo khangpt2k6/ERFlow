@@ -8,107 +8,169 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/erflow/backend/internal/metrics"
 	"github.com/erflow/backend/internal/models"
-	"github.com/erflow/backend/internal/scheduler"
 	"github.com/erflow/backend/internal/store"
 )
 
-// TreatmentJob is a unit of work for the doctor worker pool.
+// TreatmentJob is a unit of work for the worker pool.
 type TreatmentJob struct {
-	Patient  *models.Patient
-	BedID    string
-	DoctorID string
+	Patient    *models.Patient
+	BedID      string
+	DoctorID   string
+	EnqueuedAt time.Time // set at submit time — for end-to-end latency
 }
 
 // WorkerPoolStats is returned to the frontend for visualization.
 type WorkerPoolStats struct {
-	Workers        int   `json:"workers"`
-	ActiveJobs     int32 `json:"activeJobs"`
-	QueuedJobs     int   `json:"queuedJobs"`
-	TotalCompleted int64 `json:"totalCompleted"`
+	Workers        int             `json:"workers"`
+	ActiveJobs     int32           `json:"activeJobs"`
+	QueuedJobs     int             `json:"queuedJobs"`
+	QueueCapacity  int             `json:"queueCapacity"`
+	TotalCompleted int64           `json:"totalCompleted"`
+	TotalSubmitted int64           `json:"totalSubmitted"`
+	Latency        LatencySnapshot `json:"latency"`
 }
 
-// WorkerPool implements a bounded goroutine pool where each worker represents a doctor.
-// OS parallel: a thread pool — N worker threads pull tasks from a shared work queue.
-// When all workers are busy, new jobs queue up in the channel (backpressure).
+// discharge signals a completed treatment back to the engine.
+type discharge struct {
+	patient *models.Patient
+	bedID   string
+	docID   string
+	latency time.Duration
+}
+
+// WorkerPool implements a dynamically-sized goroutine pool.
+// Workers can be added (ScaleUp) or removed (ScaleDown) at runtime
+// without stopping the pool or losing in-flight jobs.
+//
+// Each worker reads from the shared jobs channel. When a worker's
+// individual context is cancelled (ScaleDown), it finishes its current
+// job and exits gracefully.
 type WorkerPool struct {
-	jobs           chan TreatmentJob
-	results        chan discharge
-	workers        int
+	jobs    chan TreatmentJob
+	results chan discharge
+
 	activeJobs     atomic.Int32
 	totalCompleted atomic.Int64
-	store          *store.MemStore
-	scaledSleepFn  func(ctx context.Context, base time.Duration) bool
-	wg             sync.WaitGroup
+	totalSubmitted atomic.Int64
+	workers        atomic.Int32
 
-	// Context switch tracking — shared with engine
-	totalContextSwitches *atomic.Int64
+	latency *LatencyTracker
 
-	// Thrashing reference — applies overhead multiplier
-	thrashing *ThrashingMonitor
+	store         *store.MemStore
+	scaledSleepFn func(ctx context.Context, base time.Duration) bool
+
+	// Dynamic scaling: each worker has its own cancellable context.
+	workerCancels []context.CancelFunc
+	workerMu      sync.Mutex
+	wg            sync.WaitGroup
 }
 
-// NewWorkerPool creates a pool with one goroutine per doctor.
 func NewWorkerPool(
-	numWorkers int,
+	queueSize int,
 	results chan discharge,
 	st *store.MemStore,
 	sleepFn func(ctx context.Context, base time.Duration) bool,
-	ctxSwitches *atomic.Int64,
-	thrashing *ThrashingMonitor,
 ) *WorkerPool {
 	return &WorkerPool{
-		jobs:                 make(chan TreatmentJob, 20), // enough for max doctor capacity (5+4+4=13)
-		results:              results,
-		workers:              numWorkers,
-		store:                st,
-		scaledSleepFn:        sleepFn,
-		totalContextSwitches: ctxSwitches,
-		thrashing:            thrashing,
+		jobs:          make(chan TreatmentJob, queueSize),
+		results:       results,
+		store:         st,
+		scaledSleepFn: sleepFn,
+		latency:       NewLatencyTracker(10000), // 10K sample circular buffer
 	}
 }
 
-// Start launches N worker goroutines.
-func (wp *WorkerPool) Start(ctx context.Context) {
-	wp.wg.Add(wp.workers)
-	for i := 0; i < wp.workers; i++ {
-		go wp.worker(ctx, i)
-	}
-	log.Printf("%s Worker pool started: %d doctor workers", tagEngine, wp.workers)
+// Start launches the initial set of worker goroutines.
+func (wp *WorkerPool) Start(ctx context.Context, numWorkers int) {
+	wp.ScaleUp(ctx, numWorkers)
+	log.Printf("[POOL] Worker pool started: %d workers, queue capacity: %d",
+		numWorkers, cap(wp.jobs))
 }
 
-// Stop closes the jobs channel and waits for all workers to finish.
+// Stop signals all workers to finish and waits for them to exit.
 func (wp *WorkerPool) Stop() {
-	close(wp.jobs)
+	wp.workerMu.Lock()
+	for _, cancel := range wp.workerCancels {
+		cancel()
+	}
+	wp.workerCancels = nil
+	wp.workerMu.Unlock()
 	wp.wg.Wait()
+	wp.workers.Store(0)
 }
 
-// Submit sends a job to the pool. Non-blocking — returns false if channel is full.
+// ScaleUp spawns n additional worker goroutines.
+func (wp *WorkerPool) ScaleUp(ctx context.Context, n int) {
+	wp.workerMu.Lock()
+	defer wp.workerMu.Unlock()
+
+	for i := 0; i < n; i++ {
+		workerCtx, cancel := context.WithCancel(ctx)
+		wp.workerCancels = append(wp.workerCancels, cancel)
+		wp.wg.Add(1)
+		wp.workers.Add(1)
+		go wp.worker(workerCtx)
+	}
+}
+
+// ScaleDown removes n workers by cancelling their contexts.
+// Workers finish their current job before exiting (graceful).
+func (wp *WorkerPool) ScaleDown(n int) {
+	wp.workerMu.Lock()
+	defer wp.workerMu.Unlock()
+
+	for i := 0; i < n && len(wp.workerCancels) > 0; i++ {
+		last := len(wp.workerCancels) - 1
+		wp.workerCancels[last]()
+		wp.workerCancels = wp.workerCancels[:last]
+	}
+}
+
+// Submit sends a job to the pool. Non-blocking — returns false if queue is full.
 func (wp *WorkerPool) Submit(job TreatmentJob) bool {
+	job.EnqueuedAt = time.Now()
 	select {
 	case wp.jobs <- job:
+		wp.totalSubmitted.Add(1)
 		return true
 	default:
-		return false // pool exhausted — channel full
+		return false // backpressure — queue full
 	}
 }
 
-// Stats returns current pool state.
+// Stats returns current pool state for the frontend.
 func (wp *WorkerPool) Stats() WorkerPoolStats {
 	return WorkerPoolStats{
-		Workers:        wp.workers,
+		Workers:        int(wp.workers.Load()),
 		ActiveJobs:     wp.activeJobs.Load(),
 		QueuedJobs:     len(wp.jobs),
+		QueueCapacity:  cap(wp.jobs),
 		TotalCompleted: wp.totalCompleted.Load(),
+		TotalSubmitted: wp.totalSubmitted.Load(),
+		Latency:        wp.latency.Snapshot(),
 	}
 }
 
-// worker is the goroutine function — one per doctor.
-// Reads TreatmentJobs from the shared channel, handles context switch overhead,
-// applies thrashing multiplier, then simulates treatment.
-func (wp *WorkerPool) worker(ctx context.Context, id int) {
-	defer wp.wg.Done()
+// QueueDepth returns the current number of jobs waiting in the queue.
+func (wp *WorkerPool) QueueDepth() int { return len(wp.jobs) }
+
+// QueueCapacity returns the maximum queue size.
+func (wp *WorkerPool) QueueCapacity() int { return cap(wp.jobs) }
+
+// WorkerCount returns the current number of active workers.
+func (wp *WorkerPool) WorkerCount() int { return int(wp.workers.Load()) }
+
+// Latency returns the latency tracker for external access.
+func (wp *WorkerPool) Latency() *LatencyTracker { return wp.latency }
+
+// worker is the goroutine function — one per "doctor" slot.
+// Reads jobs from the shared channel, processes them, records latency.
+func (wp *WorkerPool) worker(ctx context.Context) {
+	defer func() {
+		wp.workers.Add(-1)
+		wp.wg.Done()
+	}()
 
 	for {
 		select {
@@ -119,270 +181,61 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 				return // channel closed
 			}
 			wp.activeJobs.Add(1)
-			metrics.WorkerPoolActive.Inc()
-			wp.processJob(ctx, job)
+			latency := wp.processJob(ctx, job)
 			wp.activeJobs.Add(-1)
-			metrics.WorkerPoolActive.Dec()
 			wp.totalCompleted.Add(1)
+
+			if latency > 0 {
+				wp.latency.Record(latency)
+			}
 		}
 	}
 }
 
-func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) {
+func (wp *WorkerPool) processJob(ctx context.Context, job TreatmentJob) time.Duration {
 	p := job.Patient
 	doc, _ := wp.store.GetDoctor(job.DoctorID)
 
 	if doc != nil {
 		doc.Busy = true
-
-		// --- Context Switch Overhead ---
-		// If this doctor was treating a different patient, there's overhead
-		// for switching context (reviewing new chart, setting up, etc.)
-		if doc.LastPatientID != "" && doc.LastPatientID != p.ID {
-			doc.ContextSwitches++
-			wp.totalContextSwitches.Add(1)
-			metrics.ContextSwitchesTotal.Inc()
-
-			overhead := 2 * time.Second // base context switch cost
-			log.Printf("%s %s⇄ CONTEXT SWITCH:%s %s switching from %s to %s (overhead: %v)",
-				tagTreatment, colorYellow, colorReset,
-				doc.Name, doc.LastPatientID, p.ID, overhead)
-
-			wp.store.AddEvent("context-switch",
-				fmt.Sprintf("CONTEXT SWITCH: %s switching patients (overhead %v) — switches: %d",
-					doc.Name, overhead, doc.ContextSwitches),
-				"context-switch",
-				map[string]any{
-					"doctorId":  doc.ID,
-					"fromPatient": doc.LastPatientID,
-					"toPatient":   p.ID,
-					"switches":    doc.ContextSwitches,
-				},
-			)
-
-			wp.scaledSleepFn(ctx, overhead) // actual delay
-		}
-		doc.LastPatientID = p.ID
 	}
 
-	// --- Resource acquisition ---
-	// Optimal: skip shared resources entirely (deadlock prevention by elimination).
-	// Other algorithms: acquire resources to demonstrate deadlock detection.
-	algo := wp.store.Queue.Name()
-	primaryRes, secondaryRes := resourcePlanForDoctor(job.DoctorID, algo)
-
-	if algo != scheduler.AlgoOptimal && primaryRes != "" {
-		if !wp.acquireWithWait(ctx, doc, p, primaryRes, true) {
-			if doc != nil {
-				doc.Busy = false
-			}
-			return
-		}
-		if secondaryRes != "" && !wp.acquireWithWait(ctx, doc, p, secondaryRes, false) {
-			wp.releaseResource(doc, primaryRes, p.ID)
-			if doc != nil {
-				doc.Busy = false
-			}
-			return
-		}
-	}
-
-	// Reset treatment clock to when the worker ACTUALLY starts.
-	p.TreatmentStarted = time.Now()
-
-	// --- Treatment Duration with Thrashing Multiplier ---
+	// Treatment: simulate work proportional to severity.
+	// At high speed, these become very short — allowing high throughput.
 	duration := p.RemainingTreatment
 	if duration <= 0 {
 		duration = p.EstimatedDuration
 	}
 
-	// Apply thrashing overhead — when system is thrashing, treatment takes longer
-	multiplier := wp.thrashing.OverheadMultiplier()
-	if multiplier > 1.0 {
-		duration = time.Duration(float64(duration) * multiplier)
-	}
-
 	wp.scaledSleepFn(ctx, duration)
 
-	if algo != scheduler.AlgoOptimal && primaryRes != "" {
-		if secondaryRes != "" {
-			wp.releaseResource(doc, secondaryRes, p.ID)
-		}
-		wp.releaseResource(doc, primaryRes, p.ID)
-	}
-
-	// Track doctor visit
-	p.DoctorVisits++
+	// Mark doctor done
 	if doc != nil {
 		doc.Busy = false
 		doc.TotalTreated++
 	}
 
-	// Assign nurse if not yet assigned (nurse handles vitals, meds)
-	if p.AssignedNurse == "" {
-		if nurse := wp.store.FindAvailableNurse(); nurse != nil {
-			wp.store.AssignNurse(nurse.ID, p.ID)
-			nurse.TotalAssisted++
-		}
-	}
+	// Compute end-to-end latency: from enqueue to completion
+	e2e := time.Since(job.EnqueuedAt)
 
-	// After first visit: doctor may order lab/imaging (ESI 1-3)
-	docName := "Doctor"
-	docID := job.DoctorID
-	if doc != nil {
-		docName = doc.Name
+	// Send discharge through results channel
+	d := discharge{
+		patient: p,
+		bedID:   job.BedID,
+		docID:   job.DoctorID,
+		latency: e2e,
 	}
-
-	if p.DoctorVisits == 1 && !p.LabOrdered && p.TriageLevel >= 1 && p.TriageLevel <= 3 {
-		p.LabOrdered = true
-		p.LabOrderedAt = time.Now()
-		p.Status = models.StatusAwaitingLab
-		labTypes := []string{"blood", "x-ray", "ct-scan"}
-		p.LabType = labTypes[int(p.TriageLevel)-1]
-		log.Printf("%s %s📋 LAB ORDERED:%s %s — %s for %s",
-			tagTreatment, colorCyan, colorReset, docName, p.LabType, p.Name)
-		wp.store.AddEvent("lab.ordered",
-			fmt.Sprintf("LAB ORDERED: %s ordered %s for %s", docName, p.LabType, p.Name),
-			"resource-management",
-			map[string]any{"patientId": p.ID, "labType": p.LabType, "doctorId": docID},
-		)
-		return
-	}
-
-	// If more visits needed, re-submit for next visit
-	if p.DoctorVisits < p.MaxDoctorVisits {
-		p.RemainingTreatment = p.EstimatedDuration / 3
-		p.TreatmentStarted = time.Now()
-		// Re-submit to pool so worker picks it up again
-		wp.Submit(TreatmentJob{
-			Patient:  p,
-			BedID:    job.BedID,
-			DoctorID: job.DoctorID,
-		})
-		return
-	}
-
-	// All visits complete — send to discharge/disposition
-	d := discharge{patient: p, bedID: job.BedID, docID: job.DoctorID}
 	select {
 	case wp.results <- d:
 	case <-ctx.Done():
 	}
+
+	return e2e
 }
 
-func resourcePlanForDoctor(doctorID string, algo scheduler.Algorithm) (scheduler.ResourceType, scheduler.ResourceType) {
-	// Optimal: ordered acquisition prevents circular wait (classic OS deadlock prevention).
-	// All doctors acquire in the same order: lab → or, so no cycle is possible.
-	if algo == scheduler.AlgoOptimal {
-		switch doctorID {
-		case "doc-1":
-			return scheduler.ResLab, scheduler.ResOR
-		case "doc-2":
-			return scheduler.ResLab, scheduler.ResOR
-		default:
-			return scheduler.ResImaging, scheduler.ResLab
-		}
-	}
-
-	// Other algorithms: intentionally opposing order for doc-1/doc-2 to allow circular wait.
-	// This lets us demonstrate deadlock detection & resolution as an OS concept.
-	switch doctorID {
-	case "doc-1":
-		return scheduler.ResLab, scheduler.ResOR
-	case "doc-2":
-		return scheduler.ResOR, scheduler.ResLab
-	default:
-		return scheduler.ResImaging, scheduler.ResLab
-	}
-}
-
-func (wp *WorkerPool) acquireWithWait(
-	ctx context.Context,
-	doc *models.Doctor,
-	p *models.Patient,
-	res scheduler.ResourceType,
-	primary bool,
-) bool {
-	if doc == nil {
-		return false
-	}
-
-	rm := wp.store.Resources
-	stage := "secondary"
-	if primary {
-		stage = "primary"
-	}
-	for retries := 0; retries < 12; retries++ {
-		if rm.TryAcquire(res, doc.ID) {
-			doc.WaitingFor = ""
-			if !containsResource(doc.HeldResources, string(res)) {
-				doc.HeldResources = append(doc.HeldResources, string(res))
-			}
-			wp.store.AddEvent(
-				"resource.acquired",
-				fmt.Sprintf("%s acquired %s (%s resource) for %s", doc.Name, res, stage, p.Name),
-				"deadlock",
-				map[string]any{
-					"doctorId":  doc.ID,
-					"patientId": p.ID,
-					"resource":  string(res),
-					"stage":     stage,
-				},
-			)
-			return true
-		}
-
-		doc.WaitingFor = string(res)
-		rm.RequestAndWait(res, doc.ID)
-		if retries == 0 {
-			wp.store.AddEvent(
-				"resource.wait",
-				fmt.Sprintf("%s waiting for %s while treating %s", doc.Name, res, p.Name),
-				"deadlock",
-				map[string]any{
-					"doctorId":  doc.ID,
-					"patientId": p.ID,
-					"resource":  string(res),
-					"stage":     stage,
-				},
-			)
-		}
-		if !wp.scaledSleepFn(ctx, 600*time.Millisecond) {
-			return false
-		}
-	}
-	// Timeout — proceed without resource to prevent permanent blocking
-	doc.WaitingFor = ""
-	rm.ForceRelease(res, doc.ID)
-	return true
-}
-
-func (wp *WorkerPool) releaseResource(doc *models.Doctor, res scheduler.ResourceType, patientID string) {
-	if doc == nil || res == "" {
-		return
-	}
-	wp.store.Resources.Release(res, doc.ID)
-	removeFromSlice(&doc.HeldResources, string(res))
-	if doc.WaitingFor == string(res) {
-		doc.WaitingFor = ""
-	}
-	wp.store.AddEvent(
-		"resource.released",
-		fmt.Sprintf("%s released %s", doc.Name, res),
-		"resource-management",
-		map[string]any{
-			"doctorId":  doc.ID,
-			"patientId": patientID,
-			"resource":  string(res),
-		},
-	)
-}
-
-func containsResource(arr []string, resource string) bool {
-	for _, item := range arr {
-		if item == resource {
-			return true
-		}
-	}
-	return false
+// PoolStatus is a helper for logging.
+func (wp *WorkerPool) PoolStatus() string {
+	return fmt.Sprintf("workers=%d active=%d queued=%d/%d completed=%d",
+		wp.workers.Load(), wp.activeJobs.Load(),
+		len(wp.jobs), cap(wp.jobs), wp.totalCompleted.Load())
 }
