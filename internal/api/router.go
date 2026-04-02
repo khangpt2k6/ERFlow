@@ -31,12 +31,11 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 	eh := &EngineHandler{engine: eng}
 	sse := NewSSEHandler(s, eng)
 
-	// Wire SSE broker into the store — every AddEvent pushes to connected clients
+	// Wire SSE broker into the store
 	s.OnEvent = func(eventType string, data any) {
 		sse.Broker.Publish(eventType, data)
 	}
 
-	// Prometheus metrics endpoint — scrape at /metrics
 	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/api", func(r chi.Router) {
@@ -57,7 +56,6 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 				json.NewEncoder(w).Encode(s.GetAllBeds())
 			})
 			r.Post("/{id}/assign", bh.AssignSafe)
-			r.Post("/{id}/assign-unsafe", bh.AssignUnsafe)
 			r.Post("/{id}/release", bh.Release)
 		})
 
@@ -69,58 +67,46 @@ func NewRouter(s *store.MemStore, eng *engine.Engine) *chi.Mux {
 
 		// Events
 		r.Get("/events", sh.Events)
-		r.Get("/events/stream", sse.Stream) // SSE — real-time push
+		r.Get("/events/stream", sse.Stream)
 
 		// Simulation scenarios
 		r.Route("/simulate", func(r chi.Router) {
 			r.Post("/rush-hour", sh.RushHour)
-			r.Post("/cardiac-cascade", sh.CardiacCascade)
-			r.Post("/race-condition", sh.RaceCondition)
-			r.Post("/aging", sh.Aging)
-			r.Post("/preemption", sh.Preemption)
-			r.Post("/semaphore", sh.Semaphore)
-			r.Post("/deadlock", sh.Deadlock)
-			r.Post("/thrashing", sh.Thrashing)
-			r.Post("/context-switch", sh.ContextSwitch)
+			r.Post("/stress", sh.Stress)
 			r.Post("/reset", sh.Reset)
 		})
 
-		// Engine controls (auto-simulation)
+		// Engine controls
 		r.Route("/engine", func(r chi.Router) {
 			r.Post("/start", eh.Start)
 			r.Post("/stop", eh.Stop)
 			r.Post("/speed", eh.Speed)
+			r.Post("/rps", eh.SetRPS)
 			r.Get("/status", eh.Status)
-			r.Post("/scheduler", eh.SetScheduler)
-			r.Get("/scheduler", eh.GetScheduler)
 		})
 
-		// System state — includes engine status
+		// System state — full snapshot for dashboard
 		r.Get("/system/state", func(w http.ResponseWriter, _ *http.Request) {
 			patients := s.GetAllPatients()
-			// Count by status
 			var waiting, treating, discharged int
 			for _, p := range patients {
 				switch p.Status {
-				case "waiting", "arrived", "triage":
+				case "waiting":
 					waiting++
-				case "assigned", "in-treatment", "awaiting-lab":
+				case "assigned", "in-treatment":
 					treating++
 				case "discharged", "admitted", "transferred":
 					discharged++
 				}
 			}
 			state := map[string]any{
-				"patients":   patients,
-				"beds":       s.GetAllBeds(),
-				"doctors":    s.GetAllDoctors(),
-				"nurses":     s.GetAllNurses(),
-				"queue":      s.Queue.All(),
-				"queueLen":   s.Queue.Len(),
-				"events":     s.GetEvents(),
-				"engine":     eng.Stats(),
-				"semaphores": s.SemaphoreStats(),
-				"resources":  s.Resources.Stats(),
+				"patients": patients,
+				"beds":     s.GetAllBeds(),
+				"doctors":  s.GetAllDoctors(),
+				"queue":    s.Queue.All(),
+				"queueLen": s.Queue.Len(),
+				"events":   s.GetEvents(),
+				"engine":   eng.Stats(),
 				"counts": map[string]int{
 					"waiting":    waiting,
 					"treating":   treating,
